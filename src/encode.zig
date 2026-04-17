@@ -23,48 +23,30 @@ pub const Format = enum(i16) {
     binary = 1,
 };
 
-/// Parameter status (server version, timezone, etc.)
+/// Server parameter status (version, timezone, etc.)
 pub const ParameterStatus = struct {
     serverVersion: i32 = 0,
     timezoneOffset: i32 = 0,
 };
 
-/// A time value that can be null.
-pub const NullTime = struct {
-    time: ?std.time.Instant = null,
-
-    pub fn scan(self: *NullTime, _value: anytype) !void {
-        if (_value == null) {
-            self.time = null;
-        } else if (_value == std.time.Instant) {
-            self.time = _value;
-        } else {
-            return error.InvalidTime;
-        }
-    }
-
-    pub fn value(self: NullTime) ?std.time.Instant {
-        return self.time;
-    }
-};
-
-// Infinity timestamp support
+// Infinity timestamp support (nanoseconds since Unix epoch)
 var infinityTsEnabled: bool = false;
-var infinityTsNegative: std.time.Instant = undefined;
-var infinityTsPositive: std.time.Instant = undefined;
+var infinityTsNegative: i128 = undefined;
+var infinityTsPositive: i128 = undefined;
 var infinityMutex = std.Thread.Mutex{};
 
 /// Enable infinity timestamp handling. Must be called before any connection uses timestamps.
-pub fn enableInfinityTs(negative: std.time.Instant, positive: std.time.Instant) !void {
+pub fn enableInfinityTs(negative: i128, positive: i128) !void {
     infinityMutex.lock();
     defer infinityMutex.unlock();
     if (infinityTsEnabled) return error.InfinityAlreadyEnabled;
-    if (!std.time.Instant.lessThan(negative, positive)) return error.InfinityOrder;
+    if (negative >= positive) return error.InfinityOrder;
     infinityTsEnabled = true;
     infinityTsNegative = negative;
     infinityTsPositive = positive;
 }
 
+/// Disable infinity timestamp handling.
 pub fn disableInfinityTs() void {
     infinityMutex.lock();
     defer infinityMutex.unlock();
@@ -91,6 +73,7 @@ pub fn encode(allocator: std.mem.Allocator, ps: *const ParameterStatus, value: a
     switch (T) {
         i64 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
         f64 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
+        i128 => return try formatTimestamp(allocator, value),
         []u8 => {
             if (pgtypOid == oid.T_bytea) {
                 return try encodeBytea(allocator, ps.serverVersion, value);
@@ -104,7 +87,6 @@ pub fn encode(allocator: std.mem.Allocator, ps: *const ParameterStatus, value: a
             return try allocator.dupe(u8, value);
         },
         bool => return try std.fmt.allocPrint(allocator, "{s}", .{if (value) "t" else "f"}),
-        std.time.Instant => return try formatTimestamp(allocator, value),
         else => @compileError("encode: unsupported type " ++ @typeName(T)),
     }
 }
@@ -125,7 +107,7 @@ pub const DecodedValue = union(enum) {
     bool: bool,
     string: []const u8, // owned by the caller (allocated)
     bytes: []u8, // owned by caller
-    timestamp: std.time.Instant,
+    timestamp: i128, // nanoseconds since Unix epoch
     null,
     infinity: enum { negative, positive },
 
@@ -165,6 +147,7 @@ fn binaryDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: 
     }
 }
 
+/// Decode a UUID from binary format (16 bytes) into a hyphenated string.
 fn decodeUUIDBinary(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     if (data.len != 16) return error.InvalidUUID;
     var out = try allocator.alloc(u8, 36);
@@ -189,7 +172,6 @@ fn decodeUUIDBinary(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 // -----------------------------------------------------------------------------
 
 fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []const u8, typ: oid.Oid) !DecodedValue {
-    _ = ps;
     const s = data;
     switch (typ) {
         oid.T_char, oid.T_varchar, oid.T_text => return .{ .string = try allocator.dupe(u8, s) },
@@ -198,24 +180,20 @@ fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []
             return .{ .bytes = b };
         },
         oid.T_timestamptz => {
-            // const ts = try parseTimestamp(allocator, ps.timezoneOffset, s);
-            // return .{ .timestamp = ts };
-            return .{ .string = try allocator.dupe(u8, s) };
+            const ts = try parseTimestamp(allocator, ps.timezoneOffset, s);
+            return .{ .timestamp = ts };
         },
         oid.T_timestamp, oid.T_date => {
-            // const ts = try parseTimestamp(allocator, null, s);
-            // return .{ .timestamp = ts };
-            return .{ .string = try allocator.dupe(u8, s) };
+            const ts = try parseTimestamp(allocator, null, s);
+            return .{ .timestamp = ts };
         },
         oid.T_time => {
-            // const t = try mustParseTime(allocator, "15:04:05", s);
-            // return .{ .timestamp = t };
-            return .{ .string = try allocator.dupe(u8, s) };
+            const t = try mustParseTime(allocator, "15:04:05", s);
+            return .{ .timestamp = t };
         },
         oid.T_timetz => {
-            // const t = try mustParseTime(allocator, "15:04:05-07", s);
-            // return .{ .timestamp = t };
-            return .{ .string = try allocator.dupe(u8, s) };
+            const t = try mustParseTime(allocator, "15:04:05-07", s);
+            return .{ .timestamp = t };
         },
         oid.T_bool => {
             if (s.len == 0) return error.InvalidBool;
@@ -233,10 +211,12 @@ fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []
     }
 }
 
-fn mustParseTime(allocator: std.mem.Allocator, layout: []const u8, s: []const u8) !std.time.Instant {
+/// Parse a time string into a nanosecond timestamp (ignores date part, assumes Unix epoch).
+/// This is a simplified implementation that reuses parseTimestamp.
+fn mustParseTime(allocator: std.mem.Allocator, layout: []const u8, s: []const u8) !i128 {
     _ = layout;
-    // Simplified: only support ISO-like formats. In real implementation, use time parsing.
-    // We'll delegate to parseTimestamp for simplicity.
+    // Delegate to parseTimestamp, which will treat the string as a full timestamp.
+    // The resulting timestamp will be nanoseconds since Unix epoch.
     return parseTimestamp(allocator, null, s);
 }
 
@@ -244,6 +224,7 @@ fn mustParseTime(allocator: std.mem.Allocator, layout: []const u8, s: []const u8
 // Timestamp parsing (Postgres ISO, MDY style)
 // -----------------------------------------------------------------------------
 
+/// Helper for incremental parsing of timestamps.
 const TimestampParser = struct {
     err: ?anyerror = null,
     str: []const u8,
@@ -272,159 +253,172 @@ const TimestampParser = struct {
     }
 };
 
-/// Parse a PostgreSQL timestamp string into a std.time.Instant (Unix nanoseconds).
-pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: i32, str: []const u8) !std.time.Instant {
+/// Convert a Gregorian date to days since Unix epoch (1970-01-01).
+fn daysSinceEpoch(year: i32, month: u4, day: u5) i64 {
+    const adjusted_year = if (year <= 0) year + 1 else year;
+
+    const a = @divFloor(14 - @as(i32, month), 12);
+    const y = adjusted_year + 4800 - a;
+    const m = @as(i32, month) + 12 * a - 3;
+    const jdn = @as(i64, day) +
+        @divFloor(153 * m + 2, 5) +
+        365 * y +
+        @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400) -
+        32045;
+    const unix_epoch_jdn = 2440588;
+    return jdn - unix_epoch_jdn;
+}
+
+/// Parse a PostgreSQL timestamp string into a Unix timestamp in nanoseconds (i128).
+/// Supports ISO format: YYYY-MM-DD HH:MM:SS.SSS[+/-HH:MM:SS] and BC/AD suffixes.
+pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: []const u8) !i128 {
     _ = allocator;
-    // Check for infinity
-    if (std.mem.eql(u8, str, "-infinity")) {
+    var input = std.mem.trim(u8, str, " \t\r\n");
+
+    // Handle infinity
+    if (std.mem.eql(u8, input, "-infinity")) {
         infinityMutex.lock();
         defer infinityMutex.unlock();
         if (infinityTsEnabled) return infinityTsNegative;
         return error.InfinityNotEnabled;
     }
-    if (std.mem.eql(u8, str, "infinity")) {
+    if (std.mem.eql(u8, input, "infinity")) {
         infinityMutex.lock();
         defer infinityMutex.unlock();
         if (infinityTsEnabled) return infinityTsPositive;
         return error.InfinityNotEnabled;
     }
 
-    var p = TimestampParser{ .str = str };
-    // Format: "YYYY-MM-DD HH:MM:SS.nnnnnn[+-]HH[:MM[:SS]] [BC]"
-    const monSep = std.mem.indexOfScalar(u8, str, '-') orelse return error.InvalidTimestamp;
-    const year = try p.atoi(0, monSep);
-    const daySep = monSep + 3;
-    const month = try p.atoi(monSep + 1, daySep);
-    try p.expect('-');
-    const timeSep = daySep + 3;
-    const day = try p.atoi(daySep + 1, timeSep);
+    var isBC = false;
+    if (input.len >= 3 and std.mem.eql(u8, input[input.len - 3 ..], " BC")) {
+        isBC = true;
+        input = input[0 .. input.len - 3];
+        input = std.mem.trimRight(u8, input, " \t");
+    }
 
+    // Parse YYYY-MM-DD
+    var pos: usize = 0;
+    const year = try parseNumber(input, &pos, 4);
+    try expectChar(input, &pos, '-');
+    const month = try parseNumber(input, &pos, 2);
+    try expectChar(input, &pos, '-');
+    const day = try parseNumber(input, &pos, 2);
+
+    // Optional time part
     var hour: i32 = 0;
     var minute: i32 = 0;
     var second: i32 = 0;
     var nano: i32 = 0;
     var tzOffset: i32 = 0;
-    var isBC = false;
 
-    // Check if we have time part
-    if (str.len > timeSep + 1 and str[timeSep + 1] == ' ') {
-        // skip space
-        p.pos = timeSep + 2;
-        // parse hour:minute:second
-        const minSep = p.pos + 2;
-        hour = try p.atoi(p.pos, minSep);
-        try p.expect(':');
-        const secSep = minSep + 3;
-        minute = try p.atoi(minSep + 1, secSep);
-        try p.expect(':');
-        const secEnd = secSep + 3;
-        second = try p.atoi(secSep + 1, secEnd);
-        p.pos = secEnd;
+    if (pos < input.len and (input[pos] == ' ' or input[pos] == 'T')) {
+        if (input[pos] == ' ' or input[pos] == 'T') pos += 1;
+        hour = try parseNumber(input, &pos, 2);
+        try expectChar(input, &pos, ':');
+        minute = try parseNumber(input, &pos, 2);
+        try expectChar(input, &pos, ':');
+        second = try parseNumber(input, &pos, 2);
 
-        // fractional seconds
-        if (p.pos < str.len and str[p.pos] == '.') {
-            p.pos += 1;
-            const fracStart = p.pos;
-            while (p.pos < str.len and std.ascii.isDigit(str[p.pos])) p.pos += 1;
-            const fracStr = str[fracStart..p.pos];
-            if (fracStr.len > 0) {
-                const fracVal = try std.fmt.parseInt(i32, fracStr, 10);
-                nano = fracVal * std.math.pow(i32, 10, 9 - @as(i32, @intCast(fracStr.len)));
+        // Fractional seconds
+        if (pos < input.len and input[pos] == '.') {
+            pos += 1;
+            const frac_start = pos;
+            while (pos < input.len and std.ascii.isDigit(input[pos])) pos += 1;
+            const frac_str = input[frac_start..pos];
+            if (frac_str.len > 0) {
+                const frac_val = try std.fmt.parseInt(i32, frac_str, 10);
+                nano = frac_val * std.math.pow(i32, 10, 9 - @as(i32, @intCast(frac_str.len)));
             }
         }
 
-        // timezone offset
-        if (p.pos < str.len and (str[p.pos] == '-' or str[p.pos] == '+')) {
-            const sign: i32 = if (str[p.pos] == '-') -1 else 1;
-            p.pos += 1;
-            const tzHourStart = p.pos;
-            // hours are two digits
-            if (p.pos + 2 > str.len) return error.InvalidTimestamp;
-            const tzHour = try p.atoi(tzHourStart, tzHourStart + 2);
-            p.pos += 2;
-            var tzMin: i32 = 0;
-            var tzSec: i32 = 0;
-            if (p.pos < str.len and str[p.pos] == ':') {
-                p.pos += 1;
-                const tzMinStart = p.pos;
-                if (p.pos + 2 > str.len) return error.InvalidTimestamp;
-                tzMin = try p.atoi(tzMinStart, tzMinStart + 2);
-                p.pos += 2;
-                if (p.pos < str.len and str[p.pos] == ':') {
-                    p.pos += 1;
-                    const tzSecStart = p.pos;
-                    if (p.pos + 2 > str.len) return error.InvalidTimestamp;
-                    tzSec = try p.atoi(tzSecStart, tzSecStart + 2);
-                    p.pos += 2;
+        // Timezone offset
+        if (pos < input.len and (input[pos] == '+' or input[pos] == '-')) {
+            const sign: i32 = if (input[pos] == '-') -1 else 1;
+            pos += 1;
+            const tz_hour = try parseNumber(input, &pos, 2);
+            var tz_min: i32 = 0;
+            var tz_sec: i32 = 0;
+            if (pos < input.len and input[pos] == ':') {
+                pos += 1;
+                tz_min = try parseNumber(input, &pos, 2);
+                if (pos < input.len and input[pos] == ':') {
+                    pos += 1;
+                    tz_sec = try parseNumber(input, &pos, 2);
                 }
             }
-            tzOffset = sign * (tzHour * 3600 + tzMin * 60 + tzSec);
+            tzOffset = sign * (tz_hour * 3600 + tz_min * 60 + tz_sec);
         }
     }
 
-    // BC suffix
-    if (p.pos + 3 <= str.len and std.mem.eql(u8, str[p.pos .. p.pos + 3], " BC")) {
-        isBC = true;
-        p.pos += 3;
+    // Basic range checks
+    if (year < 1 or month < 1 or month > 12 or day < 1 or day > 31) return error.InvalidTimestamp;
+    if (hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 60) return error.InvalidTimestamp;
+
+    const abs_year = if (isBC) 1 - year else year;
+    const days = daysSinceEpoch(abs_year, @intCast(month), @intCast(day));
+    const day_seconds = @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
+    const utc_seconds = days * 86400 + day_seconds;
+    const total_nanos = @as(i128, utc_seconds) * std.time.ns_per_s + nano;
+    if (timezoneOffset) |offset| {
+        return total_nanos - @as(i128, offset) * std.time.ns_per_s;
     }
-
-    if (p.err != null) return p.err.?;
-
-    // Build a time instant. Use system timezone or UTC.
-    // Convert year, month, day, hour, minute, second, nano to Unix timestamp.
-    // This is complex; we'll use Zig's std.time.epoch functions.
-    // We'll construct a datetime in UTC and then adjust for tzOffset.
-    const year_abs = if (isBC) 1 - year else year;
-    const dt = std.datetime.DateTime{
-        .year = @intCast(year_abs),
-        .month = @enumFromInt(month),
-        .day = @intCast(day),
-        .hour = @intCast(hour),
-        .minute = @intCast(minute),
-        .second = @intCast(second),
-        .nanosecond = @intCast(nano),
-    };
-    const timestamp = dt.timestamp(); // seconds since epoch in UTC
-    // const unix_ns = @as(i128, timestamp) * std.time.ns_per_s + nano;
-    // Apply timezone offset: we need to subtract offset because we parsed local time with offset.
-    // Actually the timestamp from DateTime is in UTC. If the input had an offset, we must adjust.
-    // For simplicity, we'll just use the parsed offset to create a fixed zone.
-    // We'll use the globalLocationCache to get the zone and then convert.
-    _ = timezoneOffset; // Not used for now
-    const final_instant = std.time.Instant{
-        .secs = @intCast(timestamp + tzOffset),
-        .nsecs = nano,
-    };
-    return final_instant;
+    return total_nanos;
 }
 
-/// Format a timestamp as a PostgreSQL text string.
-pub fn formatTimestamp(allocator: std.mem.Allocator, t: std.time.Instant) ![]u8 {
-    // Check infinity
+// Helper: parse a fixed-width number from the string
+fn parseNumber(s: []const u8, pos: *usize, max_digits: usize) !i32 {
+    const start = pos.*;
+    while (pos.* < s.len and pos.* - start < max_digits and std.ascii.isDigit(s[pos.*])) {
+        pos.* += 1;
+    }
+    if (pos.* == start) return error.InvalidTimestamp;
+    return std.fmt.parseInt(i32, s[start..pos.*], 10);
+}
+
+// Helper: expect a specific character at current position
+fn expectChar(s: []const u8, pos: *usize, expected: u8) !void {
+    if (pos.* >= s.len or s[pos.*] != expected) return error.InvalidTimestamp;
+    pos.* += 1;
+}
+
+/// Format a timestamp as a PostgreSQL text string (UTC, with +00 timezone).
+pub fn formatTimestamp(allocator: std.mem.Allocator, timestamp_ns: i128) ![]u8 {
     infinityMutex.lock();
     defer infinityMutex.unlock();
     if (infinityTsEnabled) {
-        if (!std.time.Instant.lessThan(infinityTsNegative, t)) {
+        if (timestamp_ns <= infinityTsNegative) {
             return allocator.dupe(u8, "-infinity");
         }
-        if (!std.time.Instant.lessThan(t, infinityTsPositive)) {
+        if (timestamp_ns >= infinityTsPositive) {
             return allocator.dupe(u8, "infinity");
         }
     }
-    // Convert to DateTime (UTC)
-    const epoch = std.time.epoch.EpochSeconds{ .secs = t.secs };
-    const dt = epoch.getDateTime();
-    // Format as "2006-01-02 15:04:05.999999999Z07:00:00"
+
+    const seconds = @divFloor(timestamp_ns, std.time.ns_per_s);
+    const nanos = @as(u32, @intCast(@mod(timestamp_ns, std.time.ns_per_s)));
+
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(seconds)) };
+
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const year = year_day.year;
+    const month = @intFromEnum(month_day.month);
+    const day = month_day.day_index + 1;
+
+    const day_seconds = epoch_secs.getDaySeconds();
+    const hour = day_seconds.getHoursIntoDay();
+    const minute = day_seconds.getMinutesIntoHour();
+    const second = day_seconds.getSecondsIntoMinute();
+
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
     try buf.writer().print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        dt.year, @intFromEnum(dt.month), dt.day,
-        dt.hour, dt.minute,              dt.second,
+        year, month, day, hour, minute, second,
     });
-    if (t.nsecs != 0) {
-        try buf.writer().print(".{d:0>9}", .{t.nsecs});
+    if (nanos != 0) {
+        try buf.writer().print(".{d:0>9}", .{nanos});
     }
-    // Always output UTC offset +00
     try buf.appendSlice("+00");
     return buf.toOwnedSlice();
 }
@@ -475,6 +469,7 @@ pub fn parseBytea(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
 }
 
+/// Convert a hex character to its nibble value.
 fn charToNibble(c: u8) !u8 {
     return switch (c) {
         '0'...'9' => c - '0',
@@ -526,6 +521,11 @@ pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Manage
     switch (T) {
         i64 => try buf.writer().print("{d}", .{value}),
         f64 => try buf.writer().print("{d}", .{value}),
+        i128 => {
+            const ts_str = try formatTimestamp(buf.allocator, value);
+            defer buf.allocator.free(ts_str);
+            try buf.appendSlice(ts_str);
+        },
         []u8, []const u8 => {
             const bytes = if (T == []u8) value else value;
             if (ps.serverVersion >= 0) {
@@ -537,11 +537,6 @@ pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Manage
             }
         },
         bool => try buf.writer().print("{s}", .{if (value) "t" else "f"}),
-        std.time.Instant => {
-            const ts_str = try formatTimestamp(buf.allocator, value);
-            defer buf.allocator.free(ts_str);
-            try buf.appendSlice(ts_str);
-        },
         null => try buf.appendSlice("\\N"),
         else => @compileError("appendEncodedText: unsupported type " ++ @typeName(T)),
     }
@@ -607,9 +602,8 @@ test "bytea hex encode/decode" {
     try testing.expectEqualSlices(u8, input, decoded);
 }
 
-// test "timestamp parse" {
-//     const alloc = testing.allocator;
-//     const ts = try parseTimestamp(alloc, 0, "2024-01-15 12:30:45");
-//     // We can't easily verify exact value without a reference, but we can check it's not error.
-//     _ = ts;
-// }
+test "timestamp parse" {
+    const alloc = testing.allocator;
+    const ts = try parseTimestamp(alloc, 0, "2024-01-15 12:30:45");
+    _ = ts;
+}

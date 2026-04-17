@@ -1119,6 +1119,12 @@ pub const Rows = struct {
         var raw_vals: [fields.len]?[]const u8 = undefined;
         if (!try self.next(&raw_vals)) return error.NoMoreRows;
 
+        var temp_allocations = std.array_list.Managed([]const u8).init(allocator);
+        errdefer {
+            for (temp_allocations.items) |item| allocator.free(item);
+            temp_allocations.deinit();
+        }
+
         inline for (fields, 0..) |field, i| {
             const raw = raw_vals[i];
             const col_typ = self.colTyps[i];
@@ -1175,23 +1181,32 @@ pub const Rows = struct {
                     },
                     .string => |val| {
                         const duped = try allocator.dupe(u8, val);
+                        try temp_allocations.append(duped);
                         if (target_type == []const u8) {
                             @field(dest, field.name) = duped;
                         } else if (@typeInfo(target_type) == .optional and @typeInfo(target_type).optional.child == []const u8) {
                             @field(dest, field.name) = duped;
                         } else {
-                            allocator.free(duped);
                             return error.TypeMismatch;
                         }
                     },
                     .bytes => |val| {
                         const duped = try allocator.dupe(u8, val);
+                        try temp_allocations.append(duped);
                         if (target_type == []u8) {
                             @field(dest, field.name) = duped;
                         } else if (@typeInfo(target_type) == .optional and @typeInfo(target_type).optional.child == []u8) {
                             @field(dest, field.name) = duped;
                         } else {
-                            allocator.free(duped);
+                            return error.TypeMismatch;
+                        }
+                    },
+                    .timestamp => |val| {
+                        if (target_type == i128) {
+                            @field(dest, field.name) = val;
+                        } else if (@typeInfo(target_type) == .optional and @typeInfo(target_type).optional.child == i128) {
+                            @field(dest, field.name) = val;
+                        } else {
                             return error.TypeMismatch;
                         }
                     },
@@ -1199,6 +1214,7 @@ pub const Rows = struct {
                 }
             }
         }
+        temp_allocations.clearAndFree();
     }
 };
 
