@@ -196,11 +196,12 @@ pub const Conn = struct {
             opts.deinit();
         };
 
+        const arena_allocator = arena_ptr.allocator();
+
         // Parse URL or connection string
         var conn_str = name;
         if (std.mem.startsWith(u8, name, "postgres://") or std.mem.startsWith(u8, name, "postgresql://")) {
-            const converted = try url.parseURL(allocator, name);
-            defer allocator.free(converted);
+            const converted = try url.parseURL(arena_allocator, name);
             conn_str = converted;
         }
         try parseOptsWithDefaults(allocator, conn_str, &opts);
@@ -1512,22 +1513,15 @@ fn isDriverSetting(key: []const u8) bool {
 }
 
 fn parseOptsWithDefaults(allocator: std.mem.Allocator, name: []const u8, opts: *Options) !void {
-    var i: usize = 0;
-    const n = name.len;
-    while (i < n) {
-        while (i < n and name[i] == ' ') i += 1;
-        if (i >= n) break;
-
-        const key_start = i;
-        while (i < n and name[i] != '=' and name[i] != ' ') i += 1;
-        if (i >= n or name[i] != '=') return error.InvalidConnString;
-        const key = name[key_start..i];
-        i += 1;
-
-        const val_start = i;
-        while (i < n and name[i] != ' ') i += 1;
-        const value = name[val_start..i];
-
+    var it = std.mem.splitScalar(u8, name, ' ');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq_pos = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            std.debug.print("Invalid key-value pair: '{s}'\n", .{pair});
+            return error.InvalidConnString;
+        };
+        const key = pair[0..eq_pos];
+        const value = pair[eq_pos + 1 ..];
         try opts.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
     }
     if (!opts.contains("host")) {
