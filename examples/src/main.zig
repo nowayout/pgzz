@@ -110,20 +110,18 @@ pub fn main() !void {
     var row_count: usize = 0;
     while (true) {
         var row: MyRow = undefined;
-        if (rows2.scan(MyRow, &row, allocator)) {
-            defer {
-                allocator.free(row.v_str);
-                allocator.free(row.v_varchar);
-            }
-            const formatted = pgzz.encode.formatTimestamp(allocator, row.ts_ns) catch break;
-            defer allocator.free(formatted);
-
-            std.debug.print("   {d}\t| '{s}' | '{s}' | {any} | ts={s}\n", .{ row.id, row.v_str, row.v_varchar, row.v_bool, formatted });
-            row_count += 1;
-        } else |err| {
-            if (err == error.NoMoreRows) break;
-            return err;
+        rows2.scan(MyRow, &row, allocator) catch |err| switch (err) {
+            error.NoMoreRows => break,
+            else => return err,
+        };
+        defer {
+            allocator.free(row.v_str);
+            allocator.free(row.v_varchar);
         }
+        const formatted = try pgzz.encode.formatTimestamp(allocator, row.ts_ns);
+        defer allocator.free(formatted);
+        std.debug.print("   {d}\t| '{s}' | '{s}' | {any} | ts={s}\n", .{ row.id, row.v_str, row.v_varchar, row.v_bool, formatted });
+        row_count += 1;
     }
 
     std.debug.print("Done, {} rows fetched\n", .{row_count});

@@ -26,7 +26,7 @@ pub const Format = enum(i16) {
 /// Server parameter status (version, timezone, etc.)
 pub const ParameterStatus = struct {
     serverVersion: i32 = 0,
-    timezoneOffset: i32 = 0,
+    timezoneOffset: i32 = 0, // offset in seconds from UTC
 };
 
 // Infinity timestamp support (nanoseconds since Unix epoch)
@@ -58,11 +58,11 @@ pub fn disableInfinityTs() void {
 // -----------------------------------------------------------------------------
 
 /// Binary encode a value for a parameter (uses binaryEncode internally).
-pub fn binaryEncode(ps: *const ParameterStatus, value: anytype) ![]u8 {
+pub fn binaryEncode(allocator: std.mem.Allocator, ps: *const ParameterStatus, value: anytype) ![]u8 {
     const T = @TypeOf(value);
     switch (T) {
-        []u8 => return value,
-        else => return encode(ps, value, oid.T_unknown),
+        []u8 => return try allocator.dupe(u8, value),
+        else => return encode(allocator, ps, value, oid.T_unknown),
     }
 }
 
@@ -72,7 +72,10 @@ pub fn encode(allocator: std.mem.Allocator, ps: *const ParameterStatus, value: a
     const T = @TypeOf(value);
     switch (T) {
         i64 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
+        i32 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
+        i16 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
         f64 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
+        f32 => return try std.fmt.allocPrint(allocator, "{d}", .{value}),
         i128 => return try formatTimestamp(allocator, value),
         []u8 => {
             if (pgtypOid == oid.T_bytea) {
@@ -141,7 +144,8 @@ fn binaryDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: 
             return .{ .int = @as(i16, @bitCast(std.mem.readInt(u16, data[0..2], .big))) };
         },
         oid.T_uuid => {
-            return .{ .bytes = try decodeUUIDBinary(allocator, data) };
+            const uuid_str = try decodeUUIDBinary(allocator, data);
+            return .{ .string = uuid_str };
         },
         else => return error.UnsupportedBinaryType,
     }
@@ -180,7 +184,8 @@ fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []
             return .{ .bytes = b };
         },
         oid.T_timestamptz => {
-            const ts = try parseTimestamp(allocator, ps.timezoneOffset, s);
+            const offset = if (ps.timezoneOffset != 0) ps.timezoneOffset else null;
+            const ts = try parseTimestamp(allocator, offset, s);
             return .{ .timestamp = ts };
         },
         oid.T_timestamp, oid.T_date => {
@@ -188,11 +193,11 @@ fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []
             return .{ .timestamp = ts };
         },
         oid.T_time => {
-            const t = try mustParseTime(allocator, "15:04:05", s);
+            const t = try mustParseTime(allocator, s, false);
             return .{ .timestamp = t };
         },
         oid.T_timetz => {
-            const t = try mustParseTime(allocator, "15:04:05-07", s);
+            const t = try mustParseTime(allocator, s, true);
             return .{ .timestamp = t };
         },
         oid.T_bool => {
@@ -207,51 +212,25 @@ fn textDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: []
             const f = try std.fmt.parseFloat(f64, s);
             return .{ .float = f };
         },
+        oid.T_uuid => {
+            return .{ .string = try allocator.dupe(u8, s) };
+        },
         else => return .{ .string = try allocator.dupe(u8, s) },
     }
 }
 
-/// Parse a time string into a nanosecond timestamp (ignores date part, assumes Unix epoch).
-/// This is a simplified implementation that reuses parseTimestamp.
-fn mustParseTime(allocator: std.mem.Allocator, layout: []const u8, s: []const u8) !i128 {
-    _ = layout;
-    // Delegate to parseTimestamp, which will treat the string as a full timestamp.
-    // The resulting timestamp will be nanoseconds since Unix epoch.
-    return parseTimestamp(allocator, null, s);
+/// Parse a time string (HH:MM:SS) into a nanosecond timestamp (nanoseconds since midnight).
+fn mustParseTime(allocator: std.mem.Allocator, s: []const u8, has_tz: bool) !i128 {
+    _ = has_tz;
+    const full_str = try std.fmt.allocPrint(allocator, "1970-01-01 {s}", .{s});
+    defer allocator.free(full_str);
+    const ts = try parseTimestamp(allocator, null, full_str);
+    return @mod(ts, std.time.ns_per_day);
 }
 
 // -----------------------------------------------------------------------------
 // Timestamp parsing (Postgres ISO, MDY style)
 // -----------------------------------------------------------------------------
-
-/// Helper for incremental parsing of timestamps.
-const TimestampParser = struct {
-    err: ?anyerror = null,
-    str: []const u8,
-    pos: usize = 0,
-
-    fn expect(self: *TimestampParser, char: u8) !void {
-        if (self.err != null) return;
-        if (self.pos >= self.str.len or self.str[self.pos] != char) {
-            self.err = error.InvalidTimestamp;
-        } else {
-            self.pos += 1;
-        }
-    }
-
-    fn atoi(self: *TimestampParser, begin: usize, end: usize) !i32 {
-        if (self.err != null) return 0;
-        if (begin >= end or end > self.str.len) {
-            self.err = error.InvalidTimestamp;
-            return 0;
-        }
-        const slice = self.str[begin..end];
-        return std.fmt.parseInt(i32, slice, 10) catch |e| {
-            self.err = e;
-            return 0;
-        };
-    }
-};
 
 /// Convert a Gregorian date to days since Unix epoch (1970-01-01).
 fn daysSinceEpoch(year: i32, month: u4, day: u5) i64 {
@@ -271,8 +250,8 @@ fn daysSinceEpoch(year: i32, month: u4, day: u5) i64 {
 
 /// Parse a PostgreSQL timestamp string into a Unix timestamp in nanoseconds (i128).
 /// Supports ISO format: YYYY-MM-DD HH:MM:SS.SSS[+/-HH:MM:SS] and BC/AD suffixes.
+/// Also handles 24:00 time (rolls to next day).
 pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: []const u8) !i128 {
-    _ = allocator;
     var input = std.mem.trim(u8, str, " \t\r\n");
 
     // Handle infinity
@@ -288,6 +267,25 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
         if (infinityTsEnabled) return infinityTsPositive;
         return error.InfinityNotEnabled;
     }
+
+    // Handle 24:00 time by replacing "24:00" with "00:00" and adjusting later
+    var is2400Time = false;
+    var owned_input: []u8 = undefined;
+    if (std.mem.indexOf(u8, input, "24:00")) |idx| {
+        // Only replace if it appears to be the time part (not in date)
+        // Date uses hyphens, so "24:00" should only appear in time.
+        is2400Time = true;
+        var new_input = try std.array_list.Managed(u8).initCapacity(allocator, input.len);
+        defer new_input.deinit();
+        try new_input.appendSlice(input[0..idx]);
+        try new_input.appendSlice("00:00");
+        if (idx + 5 < input.len) {
+            try new_input.appendSlice(input[idx + 5 ..]);
+        }
+        owned_input = try new_input.toOwnedSlice();
+        input = owned_input;
+    }
+    defer if (is2400Time) allocator.free(owned_input);
 
     var isBC = false;
     if (input.len >= 3 and std.mem.eql(u8, input[input.len - 3 ..], " BC")) {
@@ -327,7 +325,8 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
             const frac_str = input[frac_start..pos];
             if (frac_str.len > 0) {
                 const frac_val = try std.fmt.parseInt(i32, frac_str, 10);
-                nano = frac_val * std.math.pow(i32, 10, 9 - @as(i32, @intCast(frac_str.len)));
+                const scale = std.math.pow(i32, 10, 9 - @as(i32, @intCast(frac_str.len)));
+                nano = frac_val * scale;
             }
         }
 
@@ -357,10 +356,21 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
     const abs_year = if (isBC) 1 - year else year;
     const days = daysSinceEpoch(abs_year, @intCast(month), @intCast(day));
     const day_seconds = @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
-    const utc_seconds = days * 86400 + day_seconds;
-    const total_nanos = @as(i128, utc_seconds) * std.time.ns_per_s + nano;
-    if (timezoneOffset) |offset| {
-        return total_nanos - @as(i128, offset) * std.time.ns_per_s;
+    var utc_seconds = days * 86400 + day_seconds;
+    if (is2400Time) {
+        // Add 24 hours (86400 seconds) because we replaced 24:00 with 00:00
+        utc_seconds += 86400;
+    }
+    var total_nanos = @as(i128, utc_seconds) * std.time.ns_per_s + nano;
+
+    // Apply timezone offset if present
+    if (tzOffset != 0) {
+        total_nanos -= @as(i128, tzOffset) * std.time.ns_per_s;
+    }
+    if (timezoneOffset) |tz_off| {
+        if (tzOffset == 0) {
+            total_nanos -= @as(i128, tz_off) * std.time.ns_per_s;
+        }
     }
     return total_nanos;
 }
@@ -417,7 +427,10 @@ pub fn formatTimestamp(allocator: std.mem.Allocator, timestamp_ns: i128) ![]u8 {
         year, month, day, hour, minute, second,
     });
     if (nanos != 0) {
-        try buf.writer().print(".{d:0>9}", .{nanos});
+        const frac = @divFloor(nanos, 1000); // microseconds
+        if (frac != 0) {
+            try buf.writer().print(".{d:0>6}", .{frac});
+        }
     }
     try buf.appendSlice("+00");
     return buf.toOwnedSlice();
@@ -520,7 +533,10 @@ pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Manage
     const T = @TypeOf(value);
     switch (T) {
         i64 => try buf.writer().print("{d}", .{value}),
+        i32 => try buf.writer().print("{d}", .{value}),
+        i16 => try buf.writer().print("{d}", .{value}),
         f64 => try buf.writer().print("{d}", .{value}),
+        f32 => try buf.writer().print("{d}", .{value}),
         i128 => {
             const ts_str = try formatTimestamp(buf.allocator, value);
             defer buf.allocator.free(ts_str);
@@ -528,23 +544,29 @@ pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Manage
         },
         []u8, []const u8 => {
             const bytes = if (T == []u8) value else value;
-            if (ps.serverVersion >= 0) {
-                const encoded = try encodeBytea(buf.allocator, ps.serverVersion, bytes);
-                defer buf.allocator.free(encoded);
-                try appendEscapedText(buf, encoded);
-            } else {
-                try appendEscapedText(buf, bytes);
-            }
+            const encoded = try encodeBytea(buf.allocator, ps.serverVersion, bytes);
+            defer buf.allocator.free(encoded);
+            try appendEscapedText(buf, encoded);
         },
         bool => try buf.writer().print("{s}", .{if (value) "t" else "f"}),
-        null => try buf.appendSlice("\\N"),
-        else => @compileError("appendEncodedText: unsupported type " ++ @typeName(T)),
+        ?void => try buf.appendSlice("\\N"),
+        else => {
+            if (@typeInfo(T) == .optional) {
+                if (value) |v| {
+                    try appendEncodedText(ps, buf, v);
+                } else {
+                    try buf.appendSlice("\\N");
+                }
+            } else {
+                @compileError("appendEncodedText: unsupported type " ++ @typeName(T));
+            }
+        },
     }
 }
 
 /// Append escaped text (for COPY text format) to buffer.
+/// Escapes backslashes, newlines, carriage returns, and tabs.
 pub fn appendEscapedText(buf: *std.array_list.Managed(u8), text: []const u8) !void {
-    // Check if escaping needed
     var need_escape = false;
     for (text) |c| {
         if (c == '\\' or c == '\n' or c == '\r' or c == '\t') {
@@ -604,6 +626,14 @@ test "bytea hex encode/decode" {
 
 test "timestamp parse" {
     const alloc = testing.allocator;
-    const ts = try parseTimestamp(alloc, 0, "2024-01-15 12:30:45");
-    _ = ts;
+    const ts = try parseTimestamp(alloc, null, "2024-01-15 12:30:45");
+    try testing.expect(ts > 0);
+}
+
+test "uuid binary decode" {
+    const alloc = testing.allocator;
+    const uuid_bytes = &[_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0 };
+    const uuid_str = try decodeUUIDBinary(alloc, uuid_bytes);
+    defer alloc.free(uuid_str);
+    try testing.expectEqualStrings("12345678-9abc-def0-1234-56789abcdef0", uuid_str);
 }

@@ -17,6 +17,8 @@ pub const CopyError = error{
     CopyInProgress,
     BadConnection,
     UnexpectedMessage,
+    CopyFailed,
+    UnexpectedReady,
 };
 
 // -----------------------------------------------------------------------------
@@ -280,8 +282,15 @@ pub const CopyIn = struct {
             };
             defer if (msg.buf.data.len > 0) self.cn.allocator.free(msg.buf.data);
             switch (msg.typ) {
-                'C', 'N' => {
-                    // CommandComplete or NoticeResponse - ignore
+                'C' => {
+                    // CommandComplete - ignore
+                },
+                'N' => { // NoticeResponse - call notice handler if set
+                    if (self.cn.noticeHandler) |handler| {
+                        const notice_msg = parseErrorMessage(&msg.buf) catch continue;
+                        // Note: notice_msg is a slice into msg.buf.data, valid during this call
+                        handler(self.cn, notice_msg);
+                    }
                 },
                 'Z' => { // ReadyForQuery
                     self.cn.processReadyForQuery(msg.buf) catch |err| {

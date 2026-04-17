@@ -1,10 +1,13 @@
 const std = @import("std");
 pub const hstore = @import("hstore/hstore.zig");
+pub const scram = @import("scram/scram.zig");
 pub const array = @import("array.zig");
 pub const buff = @import("buff.zig");
 pub const conn = @import("conn.zig");
 pub const copy = @import("copy.zig");
 pub const encode = @import("encode.zig");
+pub const errors = @import("error.zig");
+pub const notice = @import("notice.zig");
 pub const notify = @import("notify.zig");
 pub const oid = @import("oid.zig");
 pub const rows = @import("rows.zig");

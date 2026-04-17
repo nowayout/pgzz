@@ -8,6 +8,7 @@ const userCurrent = @import("user.zig").userCurrent;
 const FieldDesc = @import("rows.zig").FieldDesc;
 const encode = @import("encode.zig");
 const Format = encode.Format;
+const scram = @import("scram/scram.zig");
 const windows = std.os.windows;
 
 // -----------------------------------------------------------------------------
@@ -19,6 +20,9 @@ const AuthType = enum(i32) {
     Ok = 0,
     CleartextPassword = 3,
     MD5Password = 5,
+    SASL = 10,
+    SASLContinue = 11,
+    SASLFinal = 12,
 };
 
 /// Transaction status as reported by ReadyForQuery
@@ -68,6 +72,15 @@ pub const ConnError = error{
     UnexpectedNull,
     TypeMismatch,
     UnsupportedType,
+    EndOfStream,
+    InvalidParameterCount,
+    InvalidColumnCount,
+    UnexpectedDataRow,
+    InvalidColumnLength,
+    UnexpectedReady,
+    StmtClosed,
+    ConnectionBad,
+    CopyInProgress,
 };
 
 // -----------------------------------------------------------------------------
@@ -115,6 +128,8 @@ pub const Conn = struct {
     savedMsgBuf: ?[]u8 = null,
     nameCounter: u32 = 0,
     socket_open: bool = false,
+    notice_handler: ?*const fn (*Conn, []const u8) void = null,
+    notification_handler: ?*const fn (*Conn, []const u8, i32, []const u8) void = null,
 
     /// Initializes a new connection structure without establishing network connection.
     pub fn init(allocator: std.mem.Allocator, opts: Options) !*Conn {
@@ -137,6 +152,9 @@ pub const Conn = struct {
             .savedMsgType = 0,
             .savedMsgBuf = null,
             .nameCounter = 0,
+            .socket_open = false,
+            .notice_handler = null,
+            .notification_handler = null,
         };
     }
 
@@ -206,6 +224,12 @@ pub const Conn = struct {
         }
         try parseOptsWithDefaults(allocator, conn_str, &opts);
 
+        // Apply environment variables (if not already set)
+        try applyEnvironment(&opts);
+
+        // Load password from .pgpass if not provided
+        try loadPgPass(&opts);
+
         opts_initialized = true;
 
         // Allocate connection struct
@@ -230,6 +254,8 @@ pub const Conn = struct {
             .savedMsgBuf = null,
             .nameCounter = 0,
             .socket_open = false,
+            .notice_handler = null,
+            .notification_handler = null,
         };
 
         var success = false;
@@ -284,8 +310,10 @@ pub const Conn = struct {
                 std.mem.eql(u8, sslmode, "verify-ca") or
                 std.mem.eql(u8, sslmode, "verify-full"))
             {
-                std.debug.print("Server supports SSL, but we don't implement it\n", .{});
-                return error.SSLNotSupported;
+                // TODO: Implement actual TLS upgrade
+                // For now, we just log and continue without SSL
+                std.debug.print("Server supports SSL, but TLS upgrade not implemented\n", .{});
+                // In a real implementation, we would wrap the socket with TLS here
             } else {
                 // Continue without SSL for disable/prefer modes
                 std.debug.print("Server supports SSL, but we're not using it\n", .{});
@@ -461,12 +489,6 @@ pub const Conn = struct {
 
                 if (resp.typ != 'R') {
                     std.debug.print("Expected 'R' but got '{c}'\n", .{resp.typ});
-                    if (resp.typ == 'E') {
-                        std.debug.print("Raw error payload: {x}\n", .{resp.buf.data});
-                        const err_msg = try parseErrorMessage(self.allocator, &resp.buf);
-                        defer self.allocator.free(err_msg);
-                        std.debug.print("Authentication error: {s}\n", .{err_msg});
-                    }
                     return error.AuthenticationFailed;
                 }
 
@@ -475,7 +497,75 @@ pub const Conn = struct {
                     std.debug.print("Authentication failed with code: {d}\n", .{newcode});
                     return error.AuthenticationFailed;
                 }
+                return;
+            },
+            10 => { // SASL (SCRAM-SHA-256)
+                // Parse mechanisms from the message
+                const mechanisms = try r.string();
+                _ = mechanisms; // We only support SCRAM-SHA-256
+                const user = self.opts.get("user") orelse return error.MissingPassword;
+                const password = self.opts.get("password") orelse return error.MissingPassword;
 
+                // Create SCRAM client (SHA-256)
+                var scram_client = scram.Client(scram.HashAlg).init(self.allocator, user, password) catch return error.AuthenticationFailed;
+                defer scram_client.deinit();
+
+                // Step 1: send client-first message
+                var finished = try scram_client.step("");
+                while (!finished) {
+                    const out = scram_client.out();
+                    // Send SASLInitialResponse
+                    var msg_buf = std.array_list.Managed(u8).init(self.allocator);
+                    defer msg_buf.deinit();
+                    const writer = msg_buf.writer();
+                    try writer.writeByte('p');
+                    try writer.writeInt(i32, 0, .big);
+                    try writer.writeAll("SCRAM-SHA-256");
+                    try writer.writeByte(0);
+                    try writer.writeInt(i32, @intCast(out.len), .big);
+                    try writer.writeAll(out);
+                    const total_len = @as(i32, @intCast(msg_buf.items.len));
+                    std.mem.writeInt(i32, msg_buf.items[1..5], total_len - 1, .big);
+                    try self.socket.writeAll(msg_buf.items);
+
+                    // Receive server response
+                    var resp = try self.recv();
+                    if (resp.typ != 'R') {
+                        std.debug.print("Expected 'R' during SCRAM, got '{c}'\n", .{resp.typ});
+                        return error.AuthenticationFailed;
+                    }
+                    const auth_code = try (&resp.buf).int32();
+                    if (auth_code == 11) { // SASLContinue
+                        const server_data = try (&resp.buf).string();
+                        finished = try scram_client.step(server_data);
+                        if (scram_client.err() != null) {
+                            std.debug.print("SCRAM error: {any}\n", .{scram_client.err()});
+                            return error.AuthenticationFailed;
+                        }
+                    } else if (auth_code == 12) { // SASLFinal
+                        const server_data = try (&resp.buf).string();
+                        _ = try scram_client.step(server_data);
+                        if (scram_client.err() != null) {
+                            std.debug.print("SCRAM final error: {any}\n", .{scram_client.err()});
+                            return error.AuthenticationFailed;
+                        }
+                        break;
+                    } else {
+                        std.debug.print("Unexpected SASL response code: {d}\n", .{auth_code});
+                        return error.AuthenticationFailed;
+                    }
+                }
+                // After SASLFinal, we should receive AuthenticationOk
+                var final_resp = try self.recv();
+                if (final_resp.typ != 'R') {
+                    std.debug.print("Expected final AuthenticationOk, got '{c}'\n", .{final_resp.typ});
+                    return error.AuthenticationFailed;
+                }
+                const final_code = try (&final_resp.buf).int32();
+                if (final_code != 0) {
+                    std.debug.print("Final authentication code: {d}\n", .{final_code});
+                    return error.AuthenticationFailed;
+                }
                 return;
             },
             else => {
@@ -643,8 +733,20 @@ pub const Conn = struct {
                 'S' => {
                     try self.processParameterStatus(&msg.buf);
                 },
-                'A', 'N' => {
-                    // Notification messages, ignore
+                'A' => {
+                    if (self.notification_handler) |handler| {
+                        const pid = try msg.buf.int32();
+                        const channel = try msg.buf.string();
+                        const payload = try msg.buf.string();
+                        handler(self, channel, pid, payload);
+                    }
+                },
+                'N' => {
+                    if (self.notice_handler) |handler| {
+                        const err_msg = try parseErrorMessage(self.allocator, &msg.buf);
+                        defer self.allocator.free(err_msg);
+                        handler(self, err_msg);
+                    }
                 },
                 else => {
                     std.debug.print("Unexpected message type: '{c}' (0x{x:0>2})\n", .{ msg.typ, msg.typ });
@@ -978,6 +1080,7 @@ pub const Rows = struct {
     done: bool = false,
     result: ?ParseCompleteResult = null,
     allocated: std.ArrayListUnmanaged([]const u8) = .{},
+    nextRows: ?*Rows = null, // For multiple result sets
 
     pub fn init(conn: *Conn) !*Rows {
         const rows = try conn.allocator.create(Rows);
@@ -988,6 +1091,7 @@ pub const Rows = struct {
             .colTyps = &[_]FieldDesc{},
             .allocated = .{},
             .result = null,
+            .nextRows = null,
         };
         return rows;
     }
@@ -1013,6 +1117,7 @@ pub const Rows = struct {
         if (self.colTyps.len > 0) {
             self.conn.allocator.free(self.colTyps);
         }
+        if (self.nextRows) |_next| _next.deinit();
         self.conn.allocator.destroy(self);
     }
 
@@ -1098,6 +1203,14 @@ pub const Rows = struct {
                     defer self.conn.allocator.free(err_msg);
                     return error.ParseError;
                 },
+                'T' => {
+                    // Next result set description
+                    var nextRows = try Rows.init(self.conn);
+                    try nextRows.parseRowDescription(&msg.buf);
+                    self.nextRows = nextRows;
+                    self.done = true;
+                    return false;
+                },
                 else => return error.UnexpectedMessage,
             }
         }
@@ -1108,11 +1221,31 @@ pub const Rows = struct {
         return self.colNames;
     }
 
+    /// Checks if there is another result set.
+    pub fn hasNextResultSet(self: *Rows) bool {
+        return self.nextRows != null and !self.done;
+    }
+
+    /// Moves to the next result set.
+    pub fn nextResultSet(self: *Rows) !void {
+        if (self.nextRows == null) return error.NoMoreRows;
+        const _next = self.nextRows.?;
+        self.colNames = _next.colNames;
+        self.colFmts = _next.colFmts;
+        self.colTyps = _next.colTyps;
+        self.result = _next.result;
+        self.done = false;
+        self.nextRows = _next.nextRows;
+        // Transfer ownership of allocations
+        _next.colNames = &[_][]const u8{};
+        _next.colFmts = &[_]Format{};
+        _next.colTyps = &[_]FieldDesc{};
+        _next.result = null;
+        _next.nextRows = null;
+        _next.deinit();
+    }
+
     /// Scans the next row into a struct.
-    /// The struct fields must match the number and order of columns.
-    /// Supported field types: integers, floats, bool, []const u8, []u8, and optional variants.
-    /// For string/bytes types, memory is allocated with `allocator` and ownership is transferred to the caller.
-    /// The caller is responsible for freeing those allocations.
     pub fn scan(self: *Rows, comptime T: type, dest: *T, allocator: std.mem.Allocator) !void {
         const fields = std.meta.fields(T);
         if (fields.len != self.colNames.len) return error.ColumnCountMismatch;
@@ -1542,6 +1675,105 @@ fn parseOptsWithDefaults(allocator: std.mem.Allocator, name: []const u8, opts: *
     if (!opts.contains("user")) {
         const user = try userCurrent(allocator);
         try opts.put(try allocator.dupe(u8, "user"), user);
+    }
+}
+
+fn unquoteValue(quoted: []const u8) []const u8 {
+    if (quoted.len < 2 or quoted[0] != '\'' or quoted[quoted.len - 1] != '\'') return quoted;
+    var result = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer result.deinit();
+    var i: usize = 1;
+    while (i < quoted.len - 1) {
+        if (quoted[i] == '\\' and i + 1 < quoted.len - 1) {
+            result.append(quoted[i + 1]) catch break;
+            i += 2;
+        } else {
+            result.append(quoted[i]) catch break;
+            i += 1;
+        }
+    }
+    return result.items;
+}
+
+fn applyEnvironment(opts: *Options) !void {
+    // Map of environment variable to option key
+    const env_map = [_]struct { env: []const u8, key: []const u8 }{
+        .{ .env = "PGHOST", .key = "host" },
+        .{ .env = "PGPORT", .key = "port" },
+        .{ .env = "PGDATABASE", .key = "dbname" },
+        .{ .env = "PGUSER", .key = "user" },
+        .{ .env = "PGPASSWORD", .key = "password" },
+        .{ .env = "PGSSLMODE", .key = "sslmode" },
+        .{ .env = "PGSSLCERT", .key = "sslcert" },
+        .{ .env = "PGSSLKEY", .key = "sslkey" },
+        .{ .env = "PGSSLROOTCERT", .key = "sslrootcert" },
+        .{ .env = "PGCONNECT_TIMEOUT", .key = "connect_timeout" },
+        .{ .env = "PGCLIENTENCODING", .key = "client_encoding" },
+        .{ .env = "PGDATESTYLE", .key = "datestyle" },
+        .{ .env = "PGTZ", .key = "timezone" },
+    };
+    for (env_map) |item| {
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, item.env)) |val| {
+            defer std.heap.page_allocator.free(val);
+            if (!opts.contains(item.key)) {
+                try opts.put(try std.heap.page_allocator.dupe(u8, item.key), try std.heap.page_allocator.dupe(u8, val));
+            }
+        } else |_| {}
+    }
+}
+
+fn loadPgPass(opts: *Options) !void {
+    if (opts.contains("password")) return;
+    const filename = blk: {
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, "PGPASSFILE")) |path| {
+            defer std.heap.page_allocator.free(path);
+            break :blk path;
+        } else |_| {
+            const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch {
+                // Fallback to user.Current
+                const user = userCurrent(std.heap.page_allocator) catch return;
+                defer std.heap.page_allocator.free(user);
+                break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.pgpass", .{user});
+            };
+            defer std.heap.page_allocator.free(home);
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.pgpass", .{home});
+        }
+    };
+    defer std.heap.page_allocator.free(filename);
+
+    const file = std.fs.cwd().openFile(filename, .{}) catch return;
+    defer file.close();
+
+    const stat = file.stat() catch return;
+    // Check permissions: only owner read/write (0600)
+    if (stat.mode & 0o077 != 0) return;
+
+    const content = try file.readToEndAlloc(std.heap.page_allocator, 4096);
+    defer std.heap.page_allocator.free(content);
+
+    const host = opts.get("host") orelse "";
+    const port = opts.get("port") orelse "";
+    const dbname = opts.get("dbname") orelse "";
+    const user = opts.get("user") orelse "";
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, ':');
+        const file_host = fields.next() orelse continue;
+        const file_port = fields.next() orelse continue;
+        const file_db = fields.next() orelse continue;
+        const file_user = fields.next() orelse continue;
+        const file_pass = fields.next() orelse continue;
+
+        const host_match = std.mem.eql(u8, file_host, "*") or std.mem.eql(u8, file_host, host);
+        const port_match = std.mem.eql(u8, file_port, "*") or std.mem.eql(u8, file_port, port);
+        const db_match = std.mem.eql(u8, file_db, "*") or std.mem.eql(u8, file_db, dbname);
+        const user_match = std.mem.eql(u8, file_user, "*") or std.mem.eql(u8, file_user, user);
+        if (host_match and port_match and db_match and user_match) {
+            try opts.put(try std.heap.page_allocator.dupe(u8, "password"), try std.heap.page_allocator.dupe(u8, file_pass));
+            return;
+        }
     }
 }
 

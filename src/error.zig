@@ -367,11 +367,67 @@ pub const Error = struct {
         return errorClassName(self.code[0..2].*);
     }
 
+    /// Returns the value of a field given its type code (e.g., 'S', 'C', 'M', etc.)
+    /// This mimics the Get method from the Go version.
+    pub fn get(self: *const Error, code: u8) []const u8 {
+        return switch (code) {
+            'S' => self.severity,
+            'C' => self.code[0..],
+            'M' => self.message,
+            'D' => self.detail,
+            'H' => self.hint,
+            'P' => self.position,
+            'p' => self.internal_position,
+            'q' => self.internal_query,
+            'W' => self.where_,
+            's' => self.schema,
+            't' => self.table,
+            'c' => self.column,
+            'd' => self.data_type_name,
+            'n' => self.constraint,
+            'F' => self.file,
+            'L' => self.line,
+            'R' => self.routine,
+            else => "",
+        };
+    }
+
     /// Formats the error for printing (implements std.fmt.format).
     pub fn format(self: *const Error, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
         _ = options;
         try writer.print("pq: {s}", .{self.message});
+    }
+
+    /// Returns a string representation of the error (for debugging).
+    pub fn errorString(self: *const Error) []const u8 {
+        return self.message;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// PGError interface (as a struct wrapper for compatibility)
+// -----------------------------------------------------------------------------
+
+/// PGError mimics the interface from the Go version, providing access to
+/// error details. This is a wrapper around Error that can be used in legacy code.
+pub const PGError = struct {
+    err: Error,
+
+    pub fn init(err: Error) PGError {
+        return .{ .err = err };
+    }
+
+    pub fn errorString(self: PGError) []const u8 {
+        return self.err.message;
+    }
+
+    pub fn fatal(self: PGError) bool {
+        return self.err.fatal();
+    }
+
+    pub fn get(self: PGError, code: u8) []const u8 {
+        return self.err.get(code);
     }
 };
 
@@ -427,34 +483,37 @@ pub fn errorf(comptime format: []const u8, args: anytype) noreturn {
     @panic(msg);
 }
 
+/// fmterrorf returns a formatted error as an anyerror.
+/// This is a convenience for returning errors without panicking.
+/// Since Zig's anyerror cannot carry a formatted string, we return a generic
+/// error and log the message. For richer error handling, use Error struct directly.
+pub fn fmterrorf(comptime format: []const u8, args: anytype) anyerror {
+    const msg = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch "fmterrorf allocation failed";
+    defer std.heap.page_allocator.free(msg);
+    std.log.err("{s}", .{msg});
+    return error.PqError;
+}
+
 /// Error recovery for functions that return an error pointer.
 /// This mimics the behavior of errRecoverNoErrBadConn in the Go code.
 /// It recovers from a panic and sets the pointed error to the recovered error,
 /// unless the recovered value is not an error (then it sets a generic error).
+/// In Zig, panics are unrecoverable by design; this function is a no-op.
+/// Use Zig's normal error handling (try/catch) instead of panics.
 pub fn errRecoverNoErrBadConn(err: *anyerror) void {
     _ = err;
-    const pan = @errorReturnTrace() orelse return;
-    // In Zig we don't have panic recovery like Go's recover.
-    // Instead, we rely on the caller to catch errors and convert panics.
-    // This function is a placeholder; in practice, Zig code should use
-    // try/catch and avoid panics. For compatibility with the Go design,
-    // we assume that any non-returned error is already captured.
-    _ = pan;
+    // In Zig we cannot recover from panics. This function exists only for
+    // compatibility with the Go API. Do not rely on it.
 }
 
 /// Error recovery for a connection.  This should be called in a defer block
 /// after any operation that may panic.  It sets the error and marks the
 /// connection bad if appropriate.
-///
-/// - `bad`: pointer to a boolean that indicates whether the connection is bad.
-/// - `err`: pointer to an error that will be set on recovery.
+/// In Zig, use normal error handling; this is a no-op.
 pub fn errRecover(bad: *bool, err: *anyerror) void {
-    // In Zig we don't have recover. Instead, we rely on the caller to
-    // propagate errors. This function is a placeholder to match the Go API.
-    // The actual implementation should be integrated into Conn methods
-    // using Zig's error handling (try/catch) rather than panics.
     _ = bad;
     _ = err;
+    // In Zig we cannot recover from panics. Do not use.
 }
 
 // -----------------------------------------------------------------------------
@@ -491,4 +550,19 @@ test "parse error response" {
     try testing.expectEqualSlices(u8, "23505", &err.code);
     try testing.expectEqualStrings("duplicate key", err.message);
     try testing.expect(err.fatal());
+}
+
+test "Error.get method" {
+    const data = &[_]u8{
+        'S', 'F', 'A', 'T', 'A', 'L', 0,
+        'C', '2', '3', '5', '0', '5', 0,
+        'M', 'd', 'u', 'p', 'l', 'i', 'c', 'a', 't', 'e', ' ', 'k', 'e', 'y', 0,
+        0,
+    };
+    var rb = buff.ReadBuf.init(data);
+    const err = try parseError(&rb);
+    try testing.expectEqualStrings("FATAL", err.get('S'));
+    try testing.expectEqualStrings("23505", err.get('C'));
+    try testing.expectEqualStrings("duplicate key", err.get('M'));
+    try testing.expectEqualStrings("", err.get('X')); // unknown code
 }
