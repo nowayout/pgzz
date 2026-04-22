@@ -9,13 +9,14 @@ const fmt = std.fmt;
 const base64 = std.base64;
 const crypto = std.crypto;
 const Allocator = mem.Allocator;
+const ArrayList = std.ArrayList;
 
 // Default hash algorithm is SHA-256. Can be replaced with any hash that follows the std.crypto.hash interface.
 pub const HashAlg = crypto.hash.sha2.Sha256;
 
 // Client returns a SCRAM-* client (SCRAM-SHA-256, etc.) for the given hash algorithm.
 // Usage:
-//   var client = try Client(Sha256).init(allocator, "username", "password");
+//   var client = try Client(Sha256).init(allocator, io, "username", "password");
 //   defer client.deinit();
 //   while (!finished) {
 //       const out = client.out();
@@ -32,24 +33,26 @@ pub fn Client(comptime H: type) type {
         const Self = @This();
 
         allocator: Allocator,
+        io: std.Io,
         user: []const u8,
         pass: []const u8,
         _step: u8 = 0,
         _err: ?anyerror = null,
-        _out: std.array_list.Managed(u8),
+        _out: ArrayList(u8),
         client_nonce: ?[]u8 = null,
         server_nonce: ?[]u8 = null,
         salted_pass: ?[]u8 = null,
-        auth_msg: std.array_list.Managed(u8),
+        auth_msg: ArrayList(u8),
 
         // Creates a new SCRAM client with the provided hash algorithm.
-        pub fn init(allocator: Allocator, user: []const u8, pass: []const u8) !Self {
+        pub fn init(allocator: Allocator, io: std.Io, user: []const u8, pass: []const u8) !Self {
             return Self{
                 .allocator = allocator,
+                .io = io,
                 .user = try allocator.dupe(u8, user),
                 .pass = try allocator.dupe(u8, pass),
-                ._out = std.array_list.Managed(u8).init(allocator),
-                .auth_msg = std.array_list.Managed(u8).init(allocator),
+                ._out = ArrayList(u8).empty,
+                .auth_msg = ArrayList(u8).empty,
             };
         }
 
@@ -57,15 +60,15 @@ pub fn Client(comptime H: type) type {
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.user);
             self.allocator.free(self.pass);
-            self._out.deinit();
-            self.auth_msg.deinit();
+            self._out.deinit(self.allocator);
+            self.auth_msg.deinit(self.allocator);
             if (self.client_nonce) |n| self.allocator.free(n);
             if (self.server_nonce) |n| self.allocator.free(n);
             if (self.salted_pass) |p| self.allocator.free(p);
         }
 
         // Sets the client nonce to the provided value.
-        // If not set, the nonce is generated automatically from crypto.random on the first step.
+        // If not set, the nonce is generated automatically using io.random on the first step.
         pub fn setNonce(self: *Self, nonce: []const u8) !void {
             if (self.client_nonce) |old| self.allocator.free(old);
             self.client_nonce = try self.allocator.dupe(u8, nonce);
@@ -103,7 +106,7 @@ pub fn Client(comptime H: type) type {
             if (self.client_nonce == null) {
                 const nonce_len = 16;
                 var buf: [nonce_len]u8 = undefined;
-                crypto.random.bytes(&buf);
+                self.io.random(&buf);
                 const encoded = try self.allocator.alloc(u8, base64.standard.Encoder.calcSize(nonce_len));
                 defer self.allocator.free(encoded);
                 _ = base64.standard.Encoder.encode(encoded, &buf);
@@ -112,20 +115,20 @@ pub fn Client(comptime H: type) type {
             const client_nonce = self.client_nonce.?;
             // Build auth_msg: "n=user,r=nonce"
             self.auth_msg.clearRetainingCapacity();
-            try self.auth_msg.appendSlice("n=");
-            try escape(self.auth_msg.writer(), self.user);
-            try self.auth_msg.appendSlice(",r=");
-            try self.auth_msg.appendSlice(client_nonce);
+            try self.auth_msg.appendSlice(self.allocator, "n=");
+            try escape(&self.auth_msg, self.allocator, self.user);
+            try self.auth_msg.appendSlice(self.allocator, ",r=");
+            try self.auth_msg.appendSlice(self.allocator, client_nonce);
             // Output: "n,,auth_msg"
-            try self._out.appendSlice("n,,");
-            try self._out.appendSlice(self.auth_msg.items);
+            try self._out.appendSlice(self.allocator, "n,,");
+            try self._out.appendSlice(self.allocator, self.auth_msg.items);
         }
 
         // Step 2: process server-first message and send client-final message
         fn step2(self: *Self, in: []const u8) !void {
             // Append server message to auth_msg
-            try self.auth_msg.append(',');
-            try self.auth_msg.appendSlice(in);
+            try self.auth_msg.append(self.allocator, ',');
+            try self.auth_msg.appendSlice(self.allocator, in);
 
             // Parse server message: "r=...,s=...,i=..."
             var fields = mem.splitScalar(u8, in, ',');
@@ -162,16 +165,16 @@ pub fn Client(comptime H: type) type {
             self.salted_pass = salted_pass;
 
             // Append ",c=biws,r=server_nonce"
-            try self.auth_msg.appendSlice(",c=biws,r=");
-            try self.auth_msg.appendSlice(server_nonce);
+            try self.auth_msg.appendSlice(self.allocator, ",c=biws,r=");
+            try self.auth_msg.appendSlice(self.allocator, server_nonce);
 
             // Build output: "c=biws,r=server_nonce,p=client_proof"
-            try self._out.appendSlice("c=biws,r=");
-            try self._out.appendSlice(server_nonce);
-            try self._out.appendSlice(",p=");
+            try self._out.appendSlice(self.allocator, "c=biws,r=");
+            try self._out.appendSlice(self.allocator, server_nonce);
+            try self._out.appendSlice(self.allocator, ",p=");
             const proof = try self.clientProof();
             defer self.allocator.free(proof);
-            try self._out.appendSlice(proof);
+            try self._out.appendSlice(self.allocator, proof);
         }
 
         // Step 3: verify server-final message
@@ -272,12 +275,12 @@ pub fn Client(comptime H: type) type {
 }
 
 // Helper function to escape '=' and ',' characters as required by SCRAM.
-fn escape(writer: anytype, s: []const u8) !void {
+fn escape(buf: *ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |ch| {
         switch (ch) {
-            '=' => try writer.writeAll("=3D"),
-            ',' => try writer.writeAll("=2C"),
-            else => try writer.writeByte(ch),
+            '=' => try buf.appendSlice(allocator, "=3D"),
+            ',' => try buf.appendSlice(allocator, "=2C"),
+            else => try buf.append(allocator, ch),
         }
     }
 }
@@ -289,7 +292,8 @@ const ScramClient = Client(Sha1);
 
 test "SCRAM step1 output format" {
     const alloc = testing.allocator;
-    var client = try ScramClient.init(alloc, "user", "pass");
+    const io = std.testing.io;
+    var client = try ScramClient.init(alloc, io, "user", "pass");
     defer client.deinit();
 
     try client.setNonce("fyko+d2lbbFgONRv9qkxdawL");
@@ -301,9 +305,10 @@ test "SCRAM step1 output format" {
 
 test "SCRAM full flow" {
     const alloc = testing.allocator;
+    const io = std.testing.io;
     
     // RFC 5802 uses password "pencil" not "pass"
-    var client = try ScramClient.init(alloc, "user", "pencil");
+    var client = try ScramClient.init(alloc, io, "user", "pencil");
     defer client.deinit();
 
     try client.setNonce("fyko+d2lbbFgONRv9qkxdawL");
@@ -332,8 +337,9 @@ test "SCRAM full flow" {
 
 test "SCRAM debug RFC 5802" {
     const alloc = testing.allocator;
+    const io = std.testing.io;
     
-    var client = try ScramClient.init(alloc, "user", "pencil");
+    var client = try ScramClient.init(alloc, io, "user", "pencil");
     defer client.deinit();
     
     try client.setNonce("fyko+d2lbbFgONRv9qkxdawL");
@@ -365,8 +371,8 @@ test "SCRAM debug RFC 5802" {
 }
 
 test "escape function" {
-    var buf = std.array_list.Managed(u8).init(testing.allocator);
-    defer buf.deinit();
-    try escape(buf.writer(), "a=b,c");
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try escape(&buf, testing.allocator, "a=b,c");
     try testing.expectEqualStrings("a=3Db=2Cc", buf.items);
 }

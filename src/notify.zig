@@ -522,16 +522,16 @@ pub const Listener = struct {
 };
 
 fn quoteIdentifierAlloc(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.append('"');
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '"');
     var it = std.mem.splitScalar(u8, name, '"');
     while (it.next()) |part| {
-        try buf.appendSlice(part);
-        if (it.index != null) try buf.append('"');
+        try buf.appendSlice(allocator, part);
+        if (it.index != null) try buf.append(allocator, '"');
     }
-    try buf.append('"');
-    return try buf.toOwnedSlice();
+    try buf.append(allocator, '"');
+    return try buf.toOwnedSlice(allocator);
 }
 
 // -----------------------------------------------------------------------------

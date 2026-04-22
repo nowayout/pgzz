@@ -1,5 +1,6 @@
 const std = @import("std");
 const Oid = @import("oid.zig").Oid;
+const ArrayList = std.ArrayList;
 
 // -----------------------------------------------------------------------------
 // ReadBuf: Read binary data from byte slices in big-endian order
@@ -85,7 +86,7 @@ pub const ReadBuf = struct {
 /// Automatically calculates and inserts message lengths.
 pub const WriteBuf = struct {
     allocator: std.mem.Allocator,
-    buf: std.array_list.Managed(u8),
+    buf: ArrayList(u8),
 
     /// Position in buffer where the current message's length should be written
     /// null when no message is currently being constructed
@@ -95,14 +96,14 @@ pub const WriteBuf = struct {
     pub fn init(allocator: std.mem.Allocator) WriteBuf {
         return .{
             .allocator = allocator,
-            .buf = std.array_list.Managed(u8).init(allocator),
+            .buf = ArrayList(u8).empty,
             .msg_len_pos = null,
         };
     }
 
     /// Release all resources associated with the WriteBuf
     pub fn deinit(self: *WriteBuf) void {
-        self.buf.deinit();
+        self.buf.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -120,9 +121,9 @@ pub const WriteBuf = struct {
         }
 
         // Start new message: write type byte and placeholder for length
-        try self.buf.append(typ);
+        try self.buf.append(self.allocator, typ);
         const new_len_pos = self.buf.items.len;
-        try self.buf.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+        try self.buf.appendSlice(self.allocator, &[_]u8{ 0, 0, 0, 0 });
         self.msg_len_pos = new_len_pos;
     }
 
@@ -143,30 +144,30 @@ pub const WriteBuf = struct {
     pub fn int32(self: *WriteBuf, n: i32) !void {
         var b: [4]u8 = undefined;
         std.mem.writeInt(i32, &b, n, .big);
-        try self.buf.appendSlice(&b);
+        try self.buf.appendSlice(self.allocator, &b);
     }
 
     /// Write a 16-bit signed integer (big-endian)
     pub fn int16(self: *WriteBuf, n: i16) !void {
         var b: [2]u8 = undefined;
         std.mem.writeInt(i16, &b, n, .big);
-        try self.buf.appendSlice(&b);
+        try self.buf.appendSlice(self.allocator, &b);
     }
 
     /// Write a null-terminated string
     pub fn string(self: *WriteBuf, s: []const u8) !void {
-        try self.buf.appendSlice(s);
-        try self.buf.append(0);
+        try self.buf.appendSlice(self.allocator, s);
+        try self.buf.append(self.allocator, 0);
     }
 
     /// Write a single byte
     pub fn byte(self: *WriteBuf, c: u8) !void {
-        try self.buf.append(c);
+        try self.buf.append(self.allocator, c);
     }
 
     /// Write raw bytes without any formatting
     pub fn bytes(self: *WriteBuf, v: []const u8) !void {
-        try self.buf.appendSlice(v);
+        try self.buf.appendSlice(self.allocator, v);
     }
 };
 
@@ -208,7 +209,7 @@ test "WriteBuf: multiple messages" {
 
     // Verify first message
     try testing.expectEqual(@as(u8, 'P'), msg1[0]);
-    const len1 = std.mem.readInt(u32, msg1[1..5][0..4], .big);
+    const len1 = std.mem.readInt(u32, msg1[1..5], .big);
     try testing.expectEqual(@as(u32, 22), len1);
 
     // Second message: Bind
@@ -225,6 +226,11 @@ test "WriteBuf: multiple messages" {
     // Verify second message
     try testing.expectEqual(@as(u8, 'B'), msg2[msg1.len]);
     const len_bytes = msg2[msg1.len + 1 .. msg1.len + 5];
-    const len2 = std.mem.readInt(u32, &len_bytes[0..4].*, .big);
+    const len2 = std.mem.readInt(u32, &[_]u8{
+        len_bytes[0],
+        len_bytes[1],
+        len_bytes[2],
+        len_bytes[3],
+    }, .big);
     try testing.expect(len2 > 0);
 }

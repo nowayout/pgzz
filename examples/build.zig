@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const psql_lib = psql_dep.module("pgzz");
 
     // Create main executable module
-    const exe_mod = b.createModule(.{
+    const exe_mod = b.addModule("example", .{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
         .name = "example",
         .root_module = exe_mod,
     });
+    exe.root_module.link_libc = true;
+
     b.installArtifact(exe);
 
     // Create 'check' build step to verify compilation

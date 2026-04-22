@@ -4,6 +4,7 @@
 const std = @import("std");
 const conn = @import("conn.zig");
 const buff = @import("buff.zig");
+const ArrayList = std.ArrayList;
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -28,57 +29,57 @@ pub const CopyError = error{
 /// Returns a SQL string for COPY table (columns...) FROM STDIN.
 /// Caller is responsible for freeing the returned string.
 pub fn copyIn(allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.appendSlice("COPY ");
-    try appendQuotedIdentifier(&buf, table);
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "COPY ");
+    try appendQuotedIdentifier(allocator, &buf, table);
     if (columns.len > 0) {
-        try buf.appendSlice(" (");
+        try buf.appendSlice(allocator, " (");
         for (columns, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try appendQuotedIdentifier(&buf, col);
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try appendQuotedIdentifier(allocator, &buf, col);
         }
-        try buf.appendSlice(")");
+        try buf.appendSlice(allocator, ")");
     }
-    try buf.appendSlice(" FROM STDIN");
-    return buf.toOwnedSlice();
+    try buf.appendSlice(allocator, " FROM STDIN");
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Returns a SQL string for COPY schema.table (columns...) FROM STDIN.
 /// Caller is responsible for freeing the returned string.
 pub fn copyInSchema(allocator: std.mem.Allocator, schema: []const u8, table: []const u8, columns: []const []const u8) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.appendSlice("COPY ");
-    try appendQuotedIdentifier(&buf, schema);
-    try buf.appendSlice(".");
-    try appendQuotedIdentifier(&buf, table);
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "COPY ");
+    try appendQuotedIdentifier(allocator, &buf, schema);
+    try buf.appendSlice(allocator, ".");
+    try appendQuotedIdentifier(allocator, &buf, table);
     if (columns.len > 0) {
-        try buf.appendSlice(" (");
+        try buf.appendSlice(allocator, " (");
         for (columns, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try appendQuotedIdentifier(&buf, col);
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try appendQuotedIdentifier(allocator, &buf, col);
         }
-        try buf.appendSlice(")");
+        try buf.appendSlice(allocator, ")");
     }
-    try buf.appendSlice(" FROM STDIN");
-    return buf.toOwnedSlice();
+    try buf.appendSlice(allocator, " FROM STDIN");
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Append a quoted PostgreSQL identifier to an array list.
 /// Doubles quotes within the identifier and surrounds with double quotes.
-fn appendQuotedIdentifier(buf: *std.array_list.Managed(u8), name: []const u8) !void {
-    try buf.append('"');
+fn appendQuotedIdentifier(allocator: std.mem.Allocator, buf: *ArrayList(u8), name: []const u8) !void {
+    try buf.append(allocator, '"');
     var it = std.mem.splitScalar(u8, name, '"');
     var first = true;
     while (it.next()) |part| {
-        if (!first) try buf.append('"'); // Double the quote
+        if (!first) try buf.append(allocator, '"'); // Double the quote
         first = false;
-        try buf.appendSlice(part);
+        try buf.appendSlice(allocator, part);
         if (it.index == null) break;
-        try buf.append('"');
+        try buf.append(allocator, '"');
     }
-    try buf.append('"');
+    try buf.append(allocator, '"');
 }
 
 /// Write a quoted PostgreSQL identifier to a writer.
@@ -106,31 +107,25 @@ const CiBufferFlushSize = 63 * 1024; // Threshold for flushing buffer
 
 /// CopyIn manages a PostgreSQL COPY FROM STDIN operation.
 /// Provides high-performance bulk data insertion.
+/// Note: This implementation is synchronous (no background thread) for simplicity.
 pub const CopyIn = struct {
     cn: *conn.Conn,
-    buffer: std.array_list.Managed(u8),
-
-    // Background thread for reading PostgreSQL responses
-    responseThread: ?std.Thread = null,
-    responseDone: std.Thread.ResetEvent = .{},
-    responseError: ?anyerror = null,
-
-    mutex: std.Thread.Mutex = .{},
+    buffer: ArrayList(u8),
     closed: bool = false,
     bad: bool = false,
 
     /// Initialize a new COPY FROM STDIN operation.
     /// The connection must be in a transaction block.
     pub fn init(cn: *conn.Conn, query: []const u8) !*CopyIn {
-        if (!cn.isInTransaction()) {
+        if (!cn.txnStatus.isInTransaction()) {
             return error.CopyNotSupportedOutsideTxn;
         }
 
         // Send the COPY query to PostgreSQL
         var w = buff.WriteBuf.init(cn.allocator);
         defer w.deinit();
-        w.byte('Q'); // 'Q' = Simple Query message
-        w.string(query);
+        try w.next('Q'); // 'Q' = Simple Query message
+        try w.string(query);
         try cn.send(&w);
 
         // Wait for CopyInResponse ('G') or error
@@ -145,26 +140,25 @@ pub const CopyIn = struct {
                     var ci = try cn.allocator.create(CopyIn);
                     ci.* = CopyIn{
                         .cn = cn,
-                        .buffer = std.array_list.Managed(u8).init(cn.allocator),
+                        .buffer = ArrayList(u8).empty,
                     };
+                    errdefer ci.buffer.deinit(cn.allocator);
 
                     // Reserve space for CopyData header (5 bytes: 'd' + length)
-                    errdefer ci.buffer.deinit();
-                    try ci.buffer.append('d');
-                    try ci.buffer.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                    try ci.buffer.append(cn.allocator, 'd');
+                    try ci.buffer.appendSlice(cn.allocator, &[_]u8{ 0, 0, 0, 0 });
 
-                    // Start background thread to read server responses
-                    ci.responseThread = try std.Thread.spawn(.{}, responseLoop, .{ci});
+                    cn.inCopy = true;
                     return ci;
                 },
                 'H' => return error.CopyToNotSupported, // COPY TO not supported
                 'E' => { // ErrorResponse
-                    const err_msg = try parseErrorMessage(msg.buf);
+                    const err_msg = try parseErrorMessage(&msg.buf);
                     _ = err_msg; // Could log or store the error message
                     return error.CopyFailed;
                 },
                 'Z' => { // ReadyForQuery
-                    try cn.processReadyForQuery(msg.buf);
+                    try cn.processReadyForQuery(&msg.buf);
                     return error.UnexpectedReady;
                 },
                 else => return error.UnexpectedMessage,
@@ -175,10 +169,7 @@ pub const CopyIn = struct {
     /// Clean up the CopyIn operation and associated resources.
     pub fn deinit(self: *CopyIn) void {
         self.close() catch {};
-        if (self.responseThread) |th| {
-            th.join();
-        }
-        self.buffer.deinit();
+        self.buffer.deinit(self.cn.allocator);
         self.cn.allocator.destroy(self);
     }
 
@@ -190,13 +181,6 @@ pub const CopyIn = struct {
         if (self.closed) return error.CopyInClosed;
         if (self.bad) return error.BadConnection;
 
-        // Check if error was set by the response thread
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.responseError != null) return self.responseError.?;
-        }
-
         if (v.len == 0) {
             // Flush and close the COPY operation
             try self.close();
@@ -205,10 +189,10 @@ pub const CopyIn = struct {
 
         // Append each value as text, separated by tabs, ending with newline
         for (v, 0..) |value, i| {
-            if (i > 0) try self.buffer.append('\t');
+            if (i > 0) try self.buffer.append(self.cn.allocator, '\t');
             try appendEncodedText(self.cn, &self.buffer, value);
         }
-        try self.buffer.append('\n');
+        try self.buffer.append(self.cn.allocator, '\n');
 
         // Flush if buffer is large enough
         if (self.buffer.items.len > CiBufferFlushSize) {
@@ -224,15 +208,16 @@ pub const CopyIn = struct {
 
         // Update message length (excluding the 'd' identifier)
         const len = items.len - 1; // Length of payload
-        std.mem.writeInt(u32, items[1..5][0..4], @intCast(len), .big);
+        std.mem.writeInt(u32, @constCast(items[1..5]), @intCast(len), .big);
 
         // Write to connection
-        try self.cn.socket.writeAll(items);
+        var writer = self.cn.socket.writer(self.cn.io, &[_]u8{});
+        try writer.interface.writeAll(items);
 
         // Reset buffer, keep header
         self.buffer.clearRetainingCapacity();
-        try self.buffer.append('d');
-        try self.buffer.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+        try self.buffer.append(self.cn.allocator, 'd');
+        try self.buffer.appendSlice(self.cn.allocator, &[_]u8{ 0, 0, 0, 0 });
     }
 
     /// Close the COPY operation and wait for completion.
@@ -248,82 +233,48 @@ pub const CopyIn = struct {
         }
 
         // Send CopyDone ('c') to indicate end of COPY data
-        try self.cn.sendSimpleMessage('c');
+        var w = buff.WriteBuf.init(self.cn.allocator);
+        defer w.deinit();
+        try w.next('c');
+        try self.cn.send(&w);
 
-        // Wait for response thread to finish
-        if (self.responseThread) |th| {
-            th.join();
-            self.responseThread = null;
-        }
-
-        // Check for error from response thread
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.responseError != null) return self.responseError.?;
-        }
-
-        self.cn.inCopy = false;
-    }
-
-    /// Returns -1 to indicate variable number of arguments for COPY.
-    pub fn numInput() i32 {
-        return -1;
-    }
-
-    /// Background thread that reads PostgreSQL responses during COPY.
-    /// Runs in a separate thread to avoid blocking the main thread.
-    fn responseLoop(self: *CopyIn) void {
-        defer self.responseDone.set();
+        // Read responses until ReadyForQuery
         while (true) {
-            const msg = self.cn.recv1() catch |err| {
-                self.setError(err);
-                return;
-            };
-            defer if (msg.buf.data.len > 0) self.cn.allocator.free(msg.buf.data);
+            const msg = try self.cn.recv1();
             switch (msg.typ) {
                 'C' => {
                     // CommandComplete - ignore
+                    continue;
                 },
                 'N' => { // NoticeResponse - call notice handler if set
-                    if (self.cn.noticeHandler) |handler| {
-                        const notice_msg = parseErrorMessage(&msg.buf) catch continue;
-                        // Note: notice_msg is a slice into msg.buf.data, valid during this call
+                    if (self.cn.notice_handler) |handler| {
+                        const notice_msg = try parseErrorMessage(&msg.buf);
+                        // notice_msg is borrowed, must be copied if needed later
                         handler(self.cn, notice_msg);
                     }
                 },
                 'Z' => { // ReadyForQuery
-                    self.cn.processReadyForQuery(msg.buf) catch |err| {
-                        self.setError(err);
-                    };
+                    try self.cn.processReadyForQuery(&msg.buf);
+                    self.cn.inCopy = false;
                     return;
                 },
                 'E' => { // ErrorResponse
-                    const err_msg = parseErrorMessage(msg.buf) catch |err| {
-                        self.setError(err);
-                        return;
-                    };
+                    const err_msg = try parseErrorMessage(&msg.buf);
                     _ = err_msg;
-                    self.setError(error.CopyFailed);
-                    return;
+                    self.bad = true;
+                    self.cn.bad = true;
+                    return error.CopyFailed;
                 },
                 else => {
-                    self.setError(error.UnexpectedMessage);
-                    return;
+                    return error.UnexpectedMessage;
                 },
             }
         }
     }
 
-    /// Set an error from the response thread.
-    fn setError(self: *CopyIn, err: anyerror) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.responseError == null) {
-            self.responseError = err;
-            self.bad = true;
-            self.cn.bad = true;
-        }
+    /// Returns -1 to indicate variable number of arguments for COPY.
+    pub fn numInput() i32 {
+        return -1;
     }
 };
 
@@ -333,11 +284,11 @@ pub const CopyIn = struct {
 
 /// Append text encoding of a value to the buffer according to PostgreSQL COPY text format.
 /// Handles NULL values and escapes special characters.
-fn appendEncodedText(cn: *conn.Conn, buf: *std.array_list.Managed(u8), value: []const u8) !void {
+fn appendEncodedText(cn: *conn.Conn, buf: *ArrayList(u8), value: []const u8) !void {
     _ = cn;
     // NULL values are represented as \N in COPY text format
     if (value.len == 0 and value.ptr == null) {
-        try buf.appendSlice("\\N");
+        try buf.appendSlice(buf.allocator, "\\N");
         return;
     }
 
@@ -346,9 +297,9 @@ fn appendEncodedText(cn: *conn.Conn, buf: *std.array_list.Managed(u8), value: []
     while (i < value.len) {
         const c = value[i];
         if (c == '\\') {
-            try buf.appendSlice("\\\\");
+            try buf.appendSlice(buf.allocator, "\\\\");
         } else {
-            try buf.append(c);
+            try buf.append(buf.allocator, c);
         }
         i += 1;
     }

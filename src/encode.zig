@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const oid = @import("oid.zig");
+const ArrayList = std.ArrayList;
 
 // -----------------------------------------------------------------------------
 // Types
@@ -33,12 +34,9 @@ pub const ParameterStatus = struct {
 var infinityTsEnabled: bool = false;
 var infinityTsNegative: i128 = undefined;
 var infinityTsPositive: i128 = undefined;
-var infinityMutex = std.Thread.Mutex{};
 
 /// Enable infinity timestamp handling. Must be called before any connection uses timestamps.
 pub fn enableInfinityTs(negative: i128, positive: i128) !void {
-    infinityMutex.lock();
-    defer infinityMutex.unlock();
     if (infinityTsEnabled) return error.InfinityAlreadyEnabled;
     if (negative >= positive) return error.InfinityOrder;
     infinityTsEnabled = true;
@@ -48,8 +46,6 @@ pub fn enableInfinityTs(negative: i128, positive: i128) !void {
 
 /// Disable infinity timestamp handling.
 pub fn disableInfinityTs() void {
-    infinityMutex.lock();
-    defer infinityMutex.unlock();
     infinityTsEnabled = false;
 }
 
@@ -256,14 +252,10 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
 
     // Handle infinity
     if (std.mem.eql(u8, input, "-infinity")) {
-        infinityMutex.lock();
-        defer infinityMutex.unlock();
         if (infinityTsEnabled) return infinityTsNegative;
         return error.InfinityNotEnabled;
     }
     if (std.mem.eql(u8, input, "infinity")) {
-        infinityMutex.lock();
-        defer infinityMutex.unlock();
         if (infinityTsEnabled) return infinityTsPositive;
         return error.InfinityNotEnabled;
     }
@@ -272,17 +264,15 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
     var is2400Time = false;
     var owned_input: []u8 = undefined;
     if (std.mem.indexOf(u8, input, "24:00")) |idx| {
-        // Only replace if it appears to be the time part (not in date)
-        // Date uses hyphens, so "24:00" should only appear in time.
         is2400Time = true;
-        var new_input = try std.array_list.Managed(u8).initCapacity(allocator, input.len);
-        defer new_input.deinit();
-        try new_input.appendSlice(input[0..idx]);
-        try new_input.appendSlice("00:00");
+        var new_input = ArrayList(u8).empty;
+        defer new_input.deinit(allocator);
+        try new_input.appendSlice(allocator, input[0..idx]);
+        try new_input.appendSlice(allocator, "00:00");
         if (idx + 5 < input.len) {
-            try new_input.appendSlice(input[idx + 5 ..]);
+            try new_input.appendSlice(allocator, input[idx + 5 ..]);
         }
-        owned_input = try new_input.toOwnedSlice();
+        owned_input = try new_input.toOwnedSlice(allocator);
         input = owned_input;
     }
     defer if (is2400Time) allocator.free(owned_input);
@@ -291,7 +281,7 @@ pub fn parseTimestamp(allocator: std.mem.Allocator, timezoneOffset: ?i32, str: [
     if (input.len >= 3 and std.mem.eql(u8, input[input.len - 3 ..], " BC")) {
         isBC = true;
         input = input[0 .. input.len - 3];
-        input = std.mem.trimRight(u8, input, " \t");
+        input = std.mem.trim(u8, input, " \t");
     }
 
     // Parse YYYY-MM-DD
@@ -393,8 +383,6 @@ fn expectChar(s: []const u8, pos: *usize, expected: u8) !void {
 
 /// Format a timestamp as a PostgreSQL text string (UTC, with +00 timezone).
 pub fn formatTimestamp(allocator: std.mem.Allocator, timestamp_ns: i128) ![]u8 {
-    infinityMutex.lock();
-    defer infinityMutex.unlock();
     if (infinityTsEnabled) {
         if (timestamp_ns <= infinityTsNegative) {
             return allocator.dupe(u8, "-infinity");
@@ -408,32 +396,38 @@ pub fn formatTimestamp(allocator: std.mem.Allocator, timestamp_ns: i128) ![]u8 {
     const nanos = @as(u32, @intCast(@mod(timestamp_ns, std.time.ns_per_s)));
 
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(seconds)) };
-
     const epoch_day = epoch_secs.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const year = year_day.year;
     const month = @intFromEnum(month_day.month);
     const day = month_day.day_index + 1;
-
     const day_seconds = epoch_secs.getDaySeconds();
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
     const second = day_seconds.getSecondsIntoMinute();
 
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.writer().print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    const date_part = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         year, month, day, hour, minute, second,
     });
+    defer allocator.free(date_part);
+    try buf.appendSlice(allocator, date_part);
+
     if (nanos != 0) {
-        const frac = @divFloor(nanos, 1000); // microseconds
+        const frac = @divFloor(nanos, 1000);
         if (frac != 0) {
-            try buf.writer().print(".{d:0>6}", .{frac});
+            const frac_str = try std.fmt.allocPrint(allocator, ".{d:0>6}", .{frac});
+            defer allocator.free(frac_str);
+            try buf.appendSlice(allocator, frac_str);
         }
     }
-    try buf.appendSlice("+00");
-    return buf.toOwnedSlice();
+
+    try buf.appendSlice(allocator, "+00");
+
+    return try buf.toOwnedSlice(allocator);
 }
 
 // -----------------------------------------------------------------------------
@@ -449,36 +443,36 @@ pub fn parseBytea(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         const out_len = hex.len / 2;
         const out = try allocator.alloc(u8, out_len);
         for (0..out_len) |i| {
-            const high = charToNibble(hex[2 * i]) catch return error.InvalidBytea;
-            const low = charToNibble(hex[2 * i + 1]) catch return error.InvalidBytea;
+            const high = try charToNibble(hex[2 * i]);
+            const low = try charToNibble(hex[2 * i + 1]);
             out[i] = (high << 4) | low;
         }
         return out;
     } else {
         // escape format
-        var out = std.array_list.Managed(u8).init(allocator);
-        defer out.deinit();
+        var out = ArrayList(u8).empty;
+        defer out.deinit(allocator);
         var i: usize = 0;
         while (i < s.len) {
             if (s[i] == '\\') {
                 i += 1;
                 if (i >= s.len) return error.InvalidBytea;
                 if (s[i] == '\\') {
-                    try out.append('\\');
+                    try out.append(allocator, '\\');
                     i += 1;
                 } else if (i + 3 <= s.len and std.ascii.isDigit(s[i]) and std.ascii.isDigit(s[i + 1]) and std.ascii.isDigit(s[i + 2])) {
                     const oct = try std.fmt.parseInt(u8, s[i .. i + 3], 8);
-                    try out.append(oct);
+                    try out.append(allocator, oct);
                     i += 3;
                 } else {
                     return error.InvalidBytea;
                 }
             } else {
-                try out.append(s[i]);
+                try out.append(allocator, s[i]);
                 i += 1;
             }
         }
-        return out.toOwnedSlice();
+        return try out.toOwnedSlice(allocator);
     }
 }
 
@@ -508,18 +502,20 @@ pub fn encodeBytea(allocator: std.mem.Allocator, serverVersion: i32, v: []const 
         return out;
     } else {
         // escape format
-        var out = std.array_list.Managed(u8).init(allocator);
-        defer out.deinit();
+        var out = ArrayList(u8).empty;
+        defer out.deinit(allocator);
         for (v) |b| {
             if (b == '\\') {
-                try out.appendSlice("\\\\");
+                try out.appendSlice(allocator, "\\\\");
             } else if (b < 0x20 or b > 0x7e) {
-                try out.writer().print("\\{o:0>3}", .{b});
+                const oct_str = try std.fmt.allocPrint(allocator, "\\{o:0>3}", .{b});
+                defer allocator.free(oct_str);
+                try out.appendSlice(allocator, oct_str);
             } else {
-                try out.append(b);
+                try out.append(allocator, b);
             }
         }
-        return out.toOwnedSlice();
+        return try out.toOwnedSlice(allocator);
     }
 }
 
@@ -528,34 +524,44 @@ pub fn encodeBytea(allocator: std.mem.Allocator, serverVersion: i32, v: []const 
 // -----------------------------------------------------------------------------
 
 /// Append text-encoded value to a buffer (allocates internally).
-/// The buffer is assumed to be an array_list.Managed(u8) that already has capacity.
-pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Managed(u8), value: anytype) !void {
+/// The buffer is assumed to be an ArrayList(u8) that already has capacity.
+pub fn appendEncodedText(ps: *const ParameterStatus, buf: *ArrayList(u8), value: anytype) !void {
+    const alloc = buf.allocator;
     const T = @TypeOf(value);
+
     switch (T) {
-        i64 => try buf.writer().print("{d}", .{value}),
-        i32 => try buf.writer().print("{d}", .{value}),
-        i16 => try buf.writer().print("{d}", .{value}),
-        f64 => try buf.writer().print("{d}", .{value}),
-        f32 => try buf.writer().print("{d}", .{value}),
+        i64, i32, i16 => {
+            const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(str);
+            try buf.appendSlice(alloc, str);
+        },
+        f64, f32 => {
+            const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(str);
+            try buf.appendSlice(alloc, str);
+        },
         i128 => {
-            const ts_str = try formatTimestamp(buf.allocator, value);
-            defer buf.allocator.free(ts_str);
-            try buf.appendSlice(ts_str);
+            const ts_str = try formatTimestamp(alloc, value);
+            defer alloc.free(ts_str);
+            try buf.appendSlice(alloc, ts_str);
         },
         []u8, []const u8 => {
             const bytes = if (T == []u8) value else value;
-            const encoded = try encodeBytea(buf.allocator, ps.serverVersion, bytes);
-            defer buf.allocator.free(encoded);
+            const encoded = try encodeBytea(alloc, ps.serverVersion, bytes);
+            defer alloc.free(encoded);
             try appendEscapedText(buf, encoded);
         },
-        bool => try buf.writer().print("{s}", .{if (value) "t" else "f"}),
-        ?void => try buf.appendSlice("\\N"),
+        bool => {
+            const str = if (value) "t" else "f";
+            try buf.appendSlice(alloc, str);
+        },
+        ?void => try buf.appendSlice(alloc, "\\N"),
         else => {
             if (@typeInfo(T) == .optional) {
                 if (value) |v| {
                     try appendEncodedText(ps, buf, v);
                 } else {
-                    try buf.appendSlice("\\N");
+                    try buf.appendSlice(alloc, "\\N");
                 }
             } else {
                 @compileError("appendEncodedText: unsupported type " ++ @typeName(T));
@@ -566,7 +572,7 @@ pub fn appendEncodedText(ps: *const ParameterStatus, buf: *std.array_list.Manage
 
 /// Append escaped text (for COPY text format) to buffer.
 /// Escapes backslashes, newlines, carriage returns, and tabs.
-pub fn appendEscapedText(buf: *std.array_list.Managed(u8), text: []const u8) !void {
+pub fn appendEscapedText(buf: *ArrayList(u8), text: []const u8) !void {
     var need_escape = false;
     for (text) |c| {
         if (c == '\\' or c == '\n' or c == '\r' or c == '\t') {
@@ -575,16 +581,16 @@ pub fn appendEscapedText(buf: *std.array_list.Managed(u8), text: []const u8) !vo
         }
     }
     if (!need_escape) {
-        try buf.appendSlice(text);
+        try buf.appendSlice(buf.allocator, text);
         return;
     }
     for (text) |c| {
         switch (c) {
-            '\\' => try buf.appendSlice("\\\\"),
-            '\n' => try buf.appendSlice("\\n"),
-            '\r' => try buf.appendSlice("\\r"),
-            '\t' => try buf.appendSlice("\\t"),
-            else => try buf.append(c),
+            '\\' => try buf.appendSlice(buf.allocator, "\\\\"),
+            '\n' => try buf.appendSlice(buf.allocator, "\\n"),
+            '\r' => try buf.appendSlice(buf.allocator, "\\r"),
+            '\t' => try buf.appendSlice(buf.allocator, "\\t"),
+            else => try buf.append(buf.allocator, c),
         }
     }
 }

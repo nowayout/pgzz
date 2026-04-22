@@ -4,6 +4,7 @@
 //! A generic `GenericArray(T)` is also available for other element types.
 
 const std = @import("std");
+const ArrayList = std.ArrayList;
 
 // -----------------------------------------------------------------------------
 // Core parsing and serialization
@@ -21,16 +22,16 @@ const std = @import("std");
 ///
 /// The delimiter is typically "," for most array types.
 pub fn parseArray(allocator: std.mem.Allocator, src: []const u8, delimiter: []const u8) !struct { dims: []usize, elems: []?[]const u8 } {
-    var dims_buf = std.array_list.Managed(usize).init(allocator);
-    var elems_buf = std.array_list.Managed(?[]const u8).init(allocator);
+    var dims_buf = ArrayList(usize).empty;
+    var elems_buf = ArrayList(?[]const u8).empty;
 
     // Ensure cleanup on error
     errdefer {
         for (elems_buf.items) |elem| {
             if (elem) |e| allocator.free(e);
         }
-        elems_buf.deinit();
-        dims_buf.deinit();
+        elems_buf.deinit(allocator);
+        dims_buf.deinit(allocator);
     }
 
     var i: usize = 0;
@@ -50,38 +51,38 @@ pub fn parseArray(allocator: std.mem.Allocator, src: []const u8, delimiter: []co
             },
             '}' => {
                 // Empty array case: "{}"
-                return .{ .dims = try dims_buf.toOwnedSlice(), .elems = try elems_buf.toOwnedSlice() };
+                return .{ .dims = try dims_buf.toOwnedSlice(allocator), .elems = try elems_buf.toOwnedSlice(allocator) };
             },
             else => break,
         }
     }
 
     // Initialize dimension counts
-    try dims_buf.resize(depth);
+    try dims_buf.resize(allocator, depth);
     @memset(dims_buf.items, 0);
 
     // Helper to read a quoted string element (returns allocated string)
     const readQuoted = struct {
         fn read(alloc: std.mem.Allocator, s: []const u8, idx: *usize) ![]const u8 {
             idx.* += 1; // Skip initial quote
-            var buf = std.array_list.Managed(u8).init(alloc);
-            defer buf.deinit();
+            var buf = ArrayList(u8).empty;
+            defer buf.deinit(alloc);
             var escape = false;
             while (idx.* < s.len) {
                 const c = s[idx.*];
                 idx.* += 1;
                 if (escape) {
-                    try buf.append(c);
+                    try buf.append(alloc, c);
                     escape = false;
                 } else {
                     switch (c) {
                         '\\' => escape = true,
                         '"' => break, // End of quoted string
-                        else => try buf.append(c),
+                        else => try buf.append(alloc, c),
                     }
                 }
             }
-            return try buf.toOwnedSlice();
+            return try buf.toOwnedSlice(alloc);
         }
     }.read;
 
@@ -117,7 +118,7 @@ pub fn parseArray(allocator: std.mem.Allocator, src: []const u8, delimiter: []co
             '"' => {
                 // Quoted string element
                 const elem = try readQuoted(allocator, src, &i);
-                try elems_buf.append(elem);
+                try elems_buf.append(allocator, elem);
                 dims_buf.items[depth - 1] += 1;
 
                 // Skip whitespace after element
@@ -145,9 +146,9 @@ pub fn parseArray(allocator: std.mem.Allocator, src: []const u8, delimiter: []co
                 if (maybe_elem) |elem_slice| {
                     // Copy the slice because it points into src which may be freed later
                     const elem = try allocator.dupe(u8, elem_slice);
-                    try elems_buf.append(elem);
+                    try elems_buf.append(allocator, elem);
                 } else {
-                    try elems_buf.append(null);
+                    try elems_buf.append(allocator, null);
                 }
                 dims_buf.items[depth - 1] += 1;
 
@@ -180,79 +181,54 @@ pub fn parseArray(allocator: std.mem.Allocator, src: []const u8, delimiter: []co
 
     if (depth != 0) return error.UnclosedArray;
 
-    return .{ .dims = try dims_buf.toOwnedSlice(), .elems = try elems_buf.toOwnedSlice() };
+    return .{ .dims = try dims_buf.toOwnedSlice(allocator), .elems = try elems_buf.toOwnedSlice(allocator) };
 }
 
 /// Serializes a slice of elements into a PostgreSQL array string.
-/// `elem_serializer` is a function that takes an element and a writer, and writes its quoted/escaped representation.
+/// `elem_serializer` is a function that takes an allocator, a buffer, and an element,
+/// and writes its quoted/escaped representation to the buffer.
 /// Returns a string that must be freed by the caller.
-///
-/// Example usage:
-/// ```zig
-/// const arr = [3]i64{1, 2, 3};
-/// const serialized = try serializeArray(allocator, &arr, ",", struct {
-///     fn ser(w: anytype, v: i64) !void { try w.print("{d}", .{v}); }
-/// }.ser);
-/// ```
-pub fn serializeArray(allocator: std.mem.Allocator, elems: anytype, delimiter: []const u8, elem_serializer: fn (writer: anytype, elem: @TypeOf(elems[0])) anyerror!void) ![]u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.append('{');
+pub fn serializeArray(allocator: std.mem.Allocator, elems: anytype, delimiter: []const u8, elem_serializer: fn (allocator: std.mem.Allocator, buf: *ArrayList(u8), elem: @TypeOf(elems[0])) anyerror!void) ![]u8 {
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '{');
     if (elems.len > 0) {
-        try elem_serializer(buf.writer(), elems[0]);
+        try elem_serializer(allocator, &buf, elems[0]);
         for (elems[1..]) |e| {
-            try buf.appendSlice(delimiter);
-            try elem_serializer(buf.writer(), e);
+            try buf.appendSlice(allocator, delimiter);
+            try elem_serializer(allocator, &buf, e);
         }
     }
-    try buf.append('}');
-    return buf.toOwnedSlice();
+    try buf.append(allocator, '}');
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Quotes and escapes a string for PostgreSQL array format.
 /// Returns an allocated string that must be freed.
 /// Handles escaping of quotes and backslashes.
 fn quoteArrayElement(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.append('"');
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '"');
     var i: usize = 0;
     while (i < s.len) {
         switch (s[i]) {
             '"' => {
-                try buf.appendSlice("\\\"");
+                try buf.appendSlice(allocator, "\\\"");
                 i += 1;
             },
             '\\' => {
-                try buf.appendSlice("\\\\");
+                try buf.appendSlice(allocator, "\\\\");
                 i += 1;
             },
             else => {
-                try buf.append(s[i]);
+                try buf.append(allocator, s[i]);
                 i += 1;
             },
         }
     }
-    try buf.append('"');
-    return buf.toOwnedSlice();
-}
-
-/// Simplified value encoder for basic types.
-/// This is a simplified version; for full PostgreSQL type support you may need a proper encoder.
-/// Not currently used in the provided array types but kept for reference.
-fn encodeValue(writer: anytype, value: anytype) !void {
-    const T = @TypeOf(value);
-    switch (T) {
-        bool => try writer.print("{s}", .{if (value) "t" else "f"}),
-        f64 => try writer.print("{d}", .{value}),
-        i64 => try writer.print("{d}", .{value}),
-        []u8 => {
-            const quoted = try quoteArrayElement(std.heap.page_allocator, value);
-            defer std.heap.page_allocator.free(quoted);
-            try writer.writeAll(quoted);
-        },
-        else => @compileError("Unsupported type for encodeValue: " ++ @typeName(T)),
-    }
+    try buf.append(allocator, '"');
+    return try buf.toOwnedSlice(allocator);
 }
 
 // -----------------------------------------------------------------------------
@@ -302,8 +278,8 @@ pub const BoolArray = struct {
     pub fn value(self: BoolArray, allocator: std.mem.Allocator) !?[]u8 {
         if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
         return @as(?[]u8, try serializeArray(allocator, self.items, ",", struct {
-            fn ser(w: anytype, v: bool) !void {
-                try w.writeAll(if (v) "t" else "f");
+            fn ser(alloc: std.mem.Allocator, buf: *ArrayList(u8), v: bool) !void {
+                try buf.appendSlice(alloc, if (v) "t" else "f");
             }
         }.ser));
     }
@@ -351,8 +327,10 @@ pub const Float64Array = struct {
     pub fn value(self: Float64Array, allocator: std.mem.Allocator) !?[]u8 {
         if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
         return @as(?[]u8, try serializeArray(allocator, self.items, ",", struct {
-            fn ser(w: anytype, v: f64) !void {
-                try w.print("{d}", .{v});
+            fn ser(alloc: std.mem.Allocator, buf: *ArrayList(u8), v: f64) !void {
+                const str = try std.fmt.allocPrint(alloc, "{d}", .{v});
+                defer alloc.free(str);
+                try buf.appendSlice(alloc, str);
             }
         }.ser));
     }
@@ -400,8 +378,10 @@ pub const Int64Array = struct {
     pub fn value(self: Int64Array, allocator: std.mem.Allocator) !?[]u8 {
         if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
         return @as(?[]u8, try serializeArray(allocator, self.items, ",", struct {
-            fn ser(w: anytype, v: i64) !void {
-                try w.print("{d}", .{v});
+            fn ser(alloc: std.mem.Allocator, buf: *ArrayList(u8), v: i64) !void {
+                const str = try std.fmt.allocPrint(alloc, "{d}", .{v});
+                defer alloc.free(str);
+                try buf.appendSlice(alloc, str);
             }
         }.ser));
     }
@@ -451,10 +431,10 @@ pub const StringArray = struct {
     pub fn value(self: StringArray, allocator: std.mem.Allocator) !?[]u8 {
         if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
         return @as(?[]u8, try serializeArray(allocator, self.items, ",", struct {
-            fn ser(w: anytype, v: []const u8) !void {
-                const quoted = try quoteArrayElement(std.heap.page_allocator, v);
-                defer std.heap.page_allocator.free(quoted);
-                try w.writeAll(quoted);
+            fn ser(alloc: std.mem.Allocator, buf: *ArrayList(u8), v: []const u8) !void {
+                const quoted = try quoteArrayElement(alloc, v);
+                defer alloc.free(quoted);
+                try buf.appendSlice(alloc, quoted);
             }
         }.ser));
     }
@@ -516,11 +496,11 @@ pub const ByteaArray = struct {
     pub fn value(self: ByteaArray, allocator: std.mem.Allocator) !?[]u8 {
         if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
         return @as(?[]u8, try serializeArray(allocator, self.items, ",", struct {
-            fn ser(w: anytype, v: []const u8) !void {
-                try w.writeAll("\"\\\\x");
+            fn ser(alloc: std.mem.Allocator, buf: *ArrayList(u8), v: []const u8) !void {
+                try buf.appendSlice(alloc, "\"\\\\x");
                 const hex = std.fmt.bytesToHex(v, .lower);
-                try w.writeAll(hex);
-                try w.writeByte('"');
+                try buf.appendSlice(alloc, hex);
+                try buf.append(alloc, '"');
             }
         }.ser));
     }
@@ -573,8 +553,8 @@ pub fn GenericArray(comptime T: type) type {
         }
 
         /// Serializes the array to PostgreSQL text format.
-        /// `elem_serializer` is a function that writes a value of type T to a writer.
-        pub fn value(self: Self, allocator: std.mem.Allocator, elem_serializer: fn (writer: anytype, elem: T) anyerror!void) !?[]u8 {
+        /// `elem_serializer` is a function that writes a value of type T to a buffer.
+        pub fn value(self: Self, allocator: std.mem.Allocator, elem_serializer: fn (allocator: std.mem.Allocator, buf: *ArrayList(u8), elem: T) anyerror!void) !?[]u8 {
             if (self.items.len == 0) return @as(?[]u8, try allocator.dupe(u8, "{}"));
             return @as(?[]u8, try serializeArray(allocator, self.items, ",", elem_serializer));
         }

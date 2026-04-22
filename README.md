@@ -36,6 +36,9 @@
     exe.root_module.addImport("pgzz", pgzz.module("pgzz"));
     ```
 
+## Build example
+    zig build -Dcpu=haswell
+
 ## Usage
 
 ### Basic connection

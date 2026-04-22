@@ -1,6 +1,8 @@
 //! PostgreSQL database connection driver.
 
 const std = @import("std");
+const Io = std.Io;
+const ArrayList = std.ArrayList;
 const oid = @import("oid.zig");
 const buff = @import("buff.zig");
 const url = @import("url.zig");
@@ -88,18 +90,24 @@ pub const ConnError = error{
 // -----------------------------------------------------------------------------
 
 pub const Dialer = struct {
-    dial: *const fn (allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: ?u32) ConnError!std.net.Stream,
+    dial: *const fn (io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: ?u32) ConnError!std.Io.net.Stream,
 
     pub const default = Dialer{
         .dial = defaultDial,
     };
 
-    fn defaultDial(allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: ?u32) ConnError!std.net.Stream {
-        _ = timeout_ms; // TODO: implement timeout
-        return std.net.tcpConnectToHost(allocator, host, port) catch |err| {
-            std.debug.print("tcpConnectToHost error: {}\n", .{err});
+    fn defaultDial(io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: ?u32) ConnError!std.Io.net.Stream {
+        _ = allocator;
+        _ = timeout_ms; // TODO: implement timeout if needed
+        const host_name = Io.net.HostName.init(host) catch |err| {
+            std.debug.print("Invalid hostname '{s}': {}\n", .{ host, err });
             return error.IoError;
         };
+        const stream = host_name.connect(io, port, .{ .mode = .stream }) catch |err| {
+            std.debug.print("Failed to connect to {s}:{}: {}\n", .{ host, port, err });
+            return error.IoError;
+        };
+        return stream;
     }
 };
 
@@ -110,13 +118,14 @@ pub const Dialer = struct {
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
-    socket: std.net.Stream,
+    socket: std.Io.net.Stream,
     read_buffer: []u8,
     write_buffer: []u8,
     opts: Options,
     dialer: Dialer,
     processID: i32 = 0,
     secretKey: i32 = 0,
+    io: std.Io,
     txnStatus: TransactionStatus = .Idle,
     parameterStatus: encode.ParameterStatus = .{},
     disablePreparedBinaryResult: bool = false,
@@ -224,13 +233,10 @@ pub const Conn = struct {
         }
         try parseOptsWithDefaults(allocator, conn_str, &opts);
 
-        // Apply environment variables (if not already set)
-        try applyEnvironment(&opts);
-
-        // Load password from .pgpass if not provided
-        try loadPgPass(&opts);
-
         opts_initialized = true;
+
+        var threaded: Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
 
         // Allocate connection struct
         const cn = try allocator.create(Conn);
@@ -241,6 +247,7 @@ pub const Conn = struct {
             .read_buffer = &[_]u8{},
             .write_buffer = &[_]u8{},
             .opts = opts,
+            .io = io,
             .dialer = dialer,
             .processID = 0,
             .secretKey = 0,
@@ -262,14 +269,14 @@ pub const Conn = struct {
         defer if (!success) {
             if (cn.read_buffer.len > 0) allocator.free(cn.read_buffer);
             if (cn.write_buffer.len > 0) allocator.free(cn.write_buffer);
-            if (cn.socket_open) cn.socket.close();
+            if (cn.socket_open) cn.socket.close(cn.io);
             allocator.destroy(cn);
         };
 
         const host = cn.opts.get("host").?;
         const port_str = cn.opts.get("port").?;
         const port = try std.fmt.parseInt(u16, port_str, 10);
-        cn.socket = try dialer.dial(allocator, host, port, null);
+        cn.socket = try dialer.dial(cn.io, allocator, host, port, null);
         cn.socket_open = true;
         cn.read_buffer = try allocator.alloc(u8, 8192);
         cn.write_buffer = try allocator.alloc(u8, 8192);
@@ -293,16 +300,13 @@ pub const Conn = struct {
         var request: [8]u8 = undefined;
         std.mem.writeInt(i32, request[0..4], 8, .big);
         std.mem.writeInt(i32, request[4..8], 80877103, .big);
-
-        try self.socket.writeAll(&request);
+        var writer = self.socket.writer(self.io, &[_]u8{});
+        try writer.interface.writeAll(&request);
 
         // Read server response (1 byte)
         var resp: [1]u8 = undefined;
-        const n = try std.posix.recv(self.socket.handle, &resp, 0);
-        if (n != 1) {
-            std.debug.print("Failed to read SSL response, got {d} bytes\n", .{n});
-            return error.SSLNotSupported;
-        }
+        var reader = self.socket.reader(self.io, &[_]u8{});
+        try reader.interface.readSliceAll(&resp);
 
         if (resp[0] == 'S') {
             // Server supports SSL
@@ -334,56 +338,47 @@ pub const Conn = struct {
     /// Sends startup packet and handles authentication.
     fn startup(self: *Conn) !void {
         // Build startup packet
-        var packet = std.array_list.Managed(u8).init(self.allocator);
-        defer packet.deinit();
+        var packet: ArrayList(u8) = .empty;
+        defer packet.deinit(self.allocator);
 
-        const writer = packet.writer();
-
-        // Reserve space for length
-        try writer.writeInt(i32, 0, .big);
-
-        // Protocol version (3.0)
-        try writer.writeInt(i32, 196608, .big);
+        try packet.appendSlice(self.allocator, &[_]u8{0, 0, 0, 0});
+        try packet.appendSlice(self.allocator, &[_]u8{0, 3, 0, 0});
+        try packet.appendSlice(self.allocator, "user");
+        try packet.append(self.allocator, 0);
 
         // Required parameters
         const user = self.opts.get("user") orelse "postgres";
+        try packet.appendSlice(self.allocator, user);
+        try packet.append(self.allocator, 0);
+
+        try packet.appendSlice(self.allocator, "database");
+        try packet.append(self.allocator, 0);
         const dbname = self.opts.get("dbname") orelse "postgres";
+        try packet.appendSlice(self.allocator, dbname);
+        try packet.append(self.allocator, 0);
 
-        // Parameter key-value pairs
-        try writer.writeAll("user");
-        try writer.writeByte(0);
-        try writer.writeAll(user);
-        try writer.writeByte(0);
-
-        try writer.writeAll("database");
-        try writer.writeByte(0);
-        try writer.writeAll(dbname);
-        try writer.writeByte(0);
-
-        // Optional parameters
-        if (self.opts.get("client_encoding")) |client_encoding| {
-            try writer.writeAll("client_encoding");
-            try writer.writeByte(0);
-            try writer.writeAll(client_encoding);
-            try writer.writeByte(0);
+        if (self.opts.get("client_encoding")) |enc| {
+            try packet.appendSlice(self.allocator, "client_encoding");
+            try packet.append(self.allocator, 0);
+            try packet.appendSlice(self.allocator, enc);
+            try packet.append(self.allocator, 0);
+        }
+        if (self.opts.get("datestyle")) |ds| {
+            try packet.appendSlice(self.allocator, "datestyle");
+            try packet.append(self.allocator, 0);
+            try packet.appendSlice(self.allocator, ds);
+            try packet.append(self.allocator, 0);
         }
 
-        if (self.opts.get("datestyle")) |datestyle| {
-            try writer.writeAll("datestyle");
-            try writer.writeByte(0);
-            try writer.writeAll(datestyle);
-            try writer.writeByte(0);
-        }
-
-        // Terminator
-        try writer.writeByte(0);
+        try packet.append(self.allocator, 0);
 
         // Update total length
         const total_len = @as(i32, @intCast(packet.items.len));
         std.mem.writeInt(i32, packet.items[0..4], total_len, .big);
 
         // Send
-        try self.socket.writeAll(packet.items);
+        var socket_writer = self.socket.writer(self.io, &[_]u8{});
+        try socket_writer.interface.writeAll(packet.items);
 
         // Read response
         while (true) {
@@ -426,16 +421,16 @@ pub const Conn = struct {
             },
             3 => { // Cleartext password
                 const password = self.opts.get("password") orelse return error.MissingPassword;
-                var msg_buf = std.array_list.Managed(u8).init(self.allocator);
-                defer msg_buf.deinit();
-                const writer = msg_buf.writer();
-                try writer.writeByte('p');
-                try writer.writeInt(i32, 0, .big);
-                try writer.writeAll(password);
-                try writer.writeByte(0);
+                var msg_buf = std.ArrayList(u8).empty;
+                defer msg_buf.deinit(self.allocator);
+                try msg_buf.append(self.allocator, 'p');
+                try msg_buf.appendSlice(self.allocator, &[_]u8{0, 0, 0, 0});
+                try msg_buf.appendSlice(self.allocator, password);
+                try msg_buf.append(self.allocator, 0);
                 const total_len = @as(i32, @intCast(msg_buf.items.len));
                 std.mem.writeInt(i32, msg_buf.items[1..5], total_len - 1, .big);
-                try self.socket.writeAll(msg_buf.items);
+                var socket_writer = self.socket.writer(self.io, &[_]u8{});
+                try socket_writer.interface.writeAll(msg_buf.items);
                 var resp = try self.recv();
                 if (resp.typ != 'R') {
                     std.debug.print("Expected 'R' but got '{c}'\n", .{resp.typ});
@@ -459,10 +454,10 @@ pub const Conn = struct {
                 const hash1_hex = try md5s(self.allocator, hash1_input);
                 defer self.allocator.free(hash1_hex);
 
-                var buf = std.array_list.Managed(u8).init(self.allocator);
-                defer buf.deinit();
-                try buf.appendSlice(hash1_hex);
-                try buf.appendSlice(salt);
+                var buf = ArrayList(u8).empty;
+                defer buf.deinit(self.allocator);
+                try buf.appendSlice(self.allocator, hash1_hex);
+                try buf.appendSlice(self.allocator, salt);
 
                 var hash2_raw: [16]u8 = undefined;
                 std.crypto.hash.Md5.hash(buf.items, &hash2_raw, .{});
@@ -471,18 +466,18 @@ pub const Conn = struct {
                 defer self.allocator.free(response);
 
                 // Build password message
-                var msg_buf = std.array_list.Managed(u8).init(self.allocator);
-                defer msg_buf.deinit();
-                const writer = msg_buf.writer();
-
-                try writer.writeByte('p');
-                try writer.writeInt(i32, 0, .big);
-                try writer.writeAll(response);
-                try writer.writeByte(0);
-
-                const total_len = @as(i32, @intCast(msg_buf.items.len));
-                std.mem.writeInt(i32, msg_buf.items[1..5], total_len - 1, .big);
-                try self.socket.writeAll(msg_buf.items);
+                var msg_buf = ArrayList(u8).empty;
+                defer msg_buf.deinit(self.allocator);
+                var temp = std.ArrayList(u8).empty;
+                defer temp.deinit(self.allocator);
+                try temp.append(self.allocator, 'p');
+                try temp.appendSlice(self.allocator, &[_]u8{0, 0, 0, 0});
+                try temp.appendSlice(self.allocator, response);
+                try temp.append(self.allocator, 0);
+                const total_len = @as(i32, @intCast(temp.items.len));
+                std.mem.writeInt(i32, temp.items[1..5], total_len - 1, .big);
+                var socket_writer = self.socket.writer(self.io, &[_]u8{});
+                try socket_writer.interface.writeAll(temp.items);
 
                 // Handle authentication response
                 var resp = try self.recv();
@@ -507,7 +502,7 @@ pub const Conn = struct {
                 const password = self.opts.get("password") orelse return error.MissingPassword;
 
                 // Create SCRAM client (SHA-256)
-                var scram_client = scram.Client(scram.HashAlg).init(self.allocator, user, password) catch return error.AuthenticationFailed;
+                var scram_client = scram.Client(scram.HashAlg).init(self.allocator, self.io, user, password) catch return error.AuthenticationFailed;
                 defer scram_client.deinit();
 
                 // Step 1: send client-first message
@@ -515,18 +510,20 @@ pub const Conn = struct {
                 while (!finished) {
                     const out = scram_client.out();
                     // Send SASLInitialResponse
-                    var msg_buf = std.array_list.Managed(u8).init(self.allocator);
-                    defer msg_buf.deinit();
-                    const writer = msg_buf.writer();
-                    try writer.writeByte('p');
-                    try writer.writeInt(i32, 0, .big);
-                    try writer.writeAll("SCRAM-SHA-256");
-                    try writer.writeByte(0);
-                    try writer.writeInt(i32, @intCast(out.len), .big);
-                    try writer.writeAll(out);
-                    const total_len = @as(i32, @intCast(msg_buf.items.len));
-                    std.mem.writeInt(i32, msg_buf.items[1..5], total_len - 1, .big);
-                    try self.socket.writeAll(msg_buf.items);
+                    var temp = ArrayList(u8).empty;
+                    defer temp.deinit(self.allocator);
+                    try temp.append(self.allocator, 'p');
+                    try temp.appendSlice(self.allocator, &[_]u8{0, 0, 0, 0});
+                    try temp.appendSlice(self.allocator, "SCRAM-SHA-256");
+                    try temp.append(self.allocator, 0);
+                    var out_len_bytes: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &out_len_bytes, @intCast(out.len), .big);
+                    try temp.appendSlice(self.allocator, out_len_bytes[0..]);
+                    try temp.appendSlice(self.allocator, out);
+                    const total_len = @as(i32, @intCast(temp.items.len));
+                    std.mem.writeInt(i32, temp.items[1..5], total_len - 1, .big);
+                    var socket_writer = self.socket.writer(self.io, &[_]u8{});
+                    try socket_writer.interface.writeAll(temp.items);
 
                     // Receive server response
                     var resp = try self.recv();
@@ -621,25 +618,13 @@ pub const Conn = struct {
 
     fn send(self: *Conn, w: *buff.WriteBuf) !void {
         const data = try w.wrap();
-        var total_written: usize = 0;
-        while (total_written < data.len) {
-            const n = try self.socket.write(data[total_written..]);
-            total_written += n;
-        }
+        var writer = self.socket.writer(self.io, &[_]u8{});
+        try writer.interface.writeAll(data);
     }
 
     fn readFull(self: *Conn, buf: []u8) !void {
-        var total: usize = 0;
-
-        while (total < buf.len) {
-            const n = try std.posix.recv(self.socket.handle, buf[total..], 0);
-
-            if (n == 0) {
-                self.bad = true;
-                return error.EndOfStream;
-            }
-            total += n;
-        }
+        var reader = self.socket.reader(self.io, &[_]u8{});
+        try reader.interface.readSliceAll(buf);
     }
 
     fn recv(self: *Conn) !RecvResult {
@@ -877,7 +862,8 @@ pub const Conn = struct {
         try w.int32(self.secretKey);
         const packet = try w.wrap();
         // Cancel request does not have a message type byte
-        try cancel_conn.socket.writeAll(packet[1..]);
+        var writer = cancel_conn.socket.writer(cancel_conn.io, &[_]u8{});
+        try writer.interface.writeAll(packet[1..]);
         // Read until EOF
         var buf2: [1024]u8 = undefined;
         while (true) {
@@ -1056,14 +1042,12 @@ pub const Conn = struct {
 
         self.bad = true;
 
-        const stream_handle = self.socket.handle;
-
         var msg_buf: [5]u8 = undefined;
         msg_buf[0] = 'X';
         std.mem.writeInt(i32, msg_buf[1..5], 4, .big);
-
-        _ = std.posix.send(stream_handle, &msg_buf, 0) catch {};
-        self.socket.close();
+        var writer = self.socket.writer(self.io, &[_]u8{});
+        _ = writer.interface.writeAll(&msg_buf) catch {};
+        self.socket.close(self.io);
     }
 };
 
@@ -1079,7 +1063,7 @@ pub const Rows = struct {
     colTyps: []FieldDesc = &[_]FieldDesc{},
     done: bool = false,
     result: ?ParseCompleteResult = null,
-    allocated: std.ArrayListUnmanaged([]const u8) = .{},
+    allocated: std.ArrayListUnmanaged([]const u8) = .empty,
     nextRows: ?*Rows = null, // For multiple result sets
 
     pub fn init(conn: *Conn) !*Rows {
@@ -1089,7 +1073,7 @@ pub const Rows = struct {
             .colNames = &[_][]const u8{},
             .colFmts = &[_]Format{},
             .colTyps = &[_]FieldDesc{},
-            .allocated = .{},
+            .allocated = .empty,
             .result = null,
             .nextRows = null,
         };
@@ -1253,10 +1237,10 @@ pub const Rows = struct {
         var raw_vals: [fields.len]?[]const u8 = undefined;
         if (!try self.next(&raw_vals)) return error.NoMoreRows;
 
-        var temp_allocations = std.array_list.Managed([]const u8).init(allocator);
+        var temp_allocations = ArrayList([]const u8).empty;
         errdefer {
             for (temp_allocations.items) |item| allocator.free(item);
-            temp_allocations.deinit();
+            temp_allocations.deinit(allocator);
         }
 
         inline for (fields, 0..) |field, i| {
@@ -1315,7 +1299,7 @@ pub const Rows = struct {
                     },
                     .string => |val| {
                         const duped = try allocator.dupe(u8, val);
-                        try temp_allocations.append(duped);
+                        try temp_allocations.append(allocator, duped);
                         if (target_type == []const u8) {
                             @field(dest, field.name) = duped;
                         } else if (@typeInfo(target_type) == .optional and @typeInfo(target_type).optional.child == []const u8) {
@@ -1326,7 +1310,7 @@ pub const Rows = struct {
                     },
                     .bytes => |val| {
                         const duped = try allocator.dupe(u8, val);
-                        try temp_allocations.append(duped);
+                        try temp_allocations.append(allocator, duped);
                         if (target_type == []u8) {
                             @field(dest, field.name) = duped;
                         } else if (@typeInfo(target_type) == .optional and @typeInfo(target_type).optional.child == []u8) {
@@ -1348,7 +1332,7 @@ pub const Rows = struct {
                 }
             }
         }
-        temp_allocations.clearAndFree();
+        temp_allocations.clearAndFree(allocator);
     }
 };
 
@@ -1680,8 +1664,8 @@ fn parseOptsWithDefaults(allocator: std.mem.Allocator, name: []const u8, opts: *
 
 fn unquoteValue(quoted: []const u8) []const u8 {
     if (quoted.len < 2 or quoted[0] != '\'' or quoted[quoted.len - 1] != '\'') return quoted;
-    var result = std.ArrayList(u8).init(std.heap.page_allocator);
-    defer result.deinit();
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(std.heap.page_allocator);
     var i: usize = 1;
     while (i < quoted.len - 1) {
         if (quoted[i] == '\\' and i + 1 < quoted.len - 1) {
@@ -1695,88 +1679,6 @@ fn unquoteValue(quoted: []const u8) []const u8 {
     return result.items;
 }
 
-fn applyEnvironment(opts: *Options) !void {
-    // Map of environment variable to option key
-    const env_map = [_]struct { env: []const u8, key: []const u8 }{
-        .{ .env = "PGHOST", .key = "host" },
-        .{ .env = "PGPORT", .key = "port" },
-        .{ .env = "PGDATABASE", .key = "dbname" },
-        .{ .env = "PGUSER", .key = "user" },
-        .{ .env = "PGPASSWORD", .key = "password" },
-        .{ .env = "PGSSLMODE", .key = "sslmode" },
-        .{ .env = "PGSSLCERT", .key = "sslcert" },
-        .{ .env = "PGSSLKEY", .key = "sslkey" },
-        .{ .env = "PGSSLROOTCERT", .key = "sslrootcert" },
-        .{ .env = "PGCONNECT_TIMEOUT", .key = "connect_timeout" },
-        .{ .env = "PGCLIENTENCODING", .key = "client_encoding" },
-        .{ .env = "PGDATESTYLE", .key = "datestyle" },
-        .{ .env = "PGTZ", .key = "timezone" },
-    };
-    for (env_map) |item| {
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, item.env)) |val| {
-            defer std.heap.page_allocator.free(val);
-            if (!opts.contains(item.key)) {
-                try opts.put(try std.heap.page_allocator.dupe(u8, item.key), try std.heap.page_allocator.dupe(u8, val));
-            }
-        } else |_| {}
-    }
-}
-
-fn loadPgPass(opts: *Options) !void {
-    if (opts.contains("password")) return;
-    const filename = blk: {
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "PGPASSFILE")) |path| {
-            defer std.heap.page_allocator.free(path);
-            break :blk path;
-        } else |_| {
-            const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch {
-                // Fallback to user.Current
-                const user = userCurrent(std.heap.page_allocator) catch return;
-                defer std.heap.page_allocator.free(user);
-                break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.pgpass", .{user});
-            };
-            defer std.heap.page_allocator.free(home);
-            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.pgpass", .{home});
-        }
-    };
-    defer std.heap.page_allocator.free(filename);
-
-    const file = std.fs.cwd().openFile(filename, .{}) catch return;
-    defer file.close();
-
-    const stat = file.stat() catch return;
-    // Check permissions: only owner read/write (0600)
-    if (stat.mode & 0o077 != 0) return;
-
-    const content = try file.readToEndAlloc(std.heap.page_allocator, 4096);
-    defer std.heap.page_allocator.free(content);
-
-    const host = opts.get("host") orelse "";
-    const port = opts.get("port") orelse "";
-    const dbname = opts.get("dbname") orelse "";
-    const user = opts.get("user") orelse "";
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0 or line[0] == '#') continue;
-        var fields = std.mem.splitScalar(u8, line, ':');
-        const file_host = fields.next() orelse continue;
-        const file_port = fields.next() orelse continue;
-        const file_db = fields.next() orelse continue;
-        const file_user = fields.next() orelse continue;
-        const file_pass = fields.next() orelse continue;
-
-        const host_match = std.mem.eql(u8, file_host, "*") or std.mem.eql(u8, file_host, host);
-        const port_match = std.mem.eql(u8, file_port, "*") or std.mem.eql(u8, file_port, port);
-        const db_match = std.mem.eql(u8, file_db, "*") or std.mem.eql(u8, file_db, dbname);
-        const user_match = std.mem.eql(u8, file_user, "*") or std.mem.eql(u8, file_user, user);
-        if (host_match and port_match and db_match and user_match) {
-            try opts.put(try std.heap.page_allocator.dupe(u8, "password"), try std.heap.page_allocator.dupe(u8, file_pass));
-            return;
-        }
-    }
-}
-
 fn md5s(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     var hash: [16]u8 = undefined;
     std.crypto.hash.Md5.hash(s, &hash, .{});
@@ -1785,9 +1687,6 @@ fn md5s(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 fn parseErrorMessage(allocator: std.mem.Allocator, r: *buff.ReadBuf) ![]const u8 {
-    var fields = std.array_list.Managed(u8).init(allocator);
-    defer fields.deinit();
-
     var severity: []const u8 = "";
     var code: []const u8 = "";
     var message: []const u8 = "";
@@ -1798,7 +1697,6 @@ fn parseErrorMessage(allocator: std.mem.Allocator, r: *buff.ReadBuf) ![]const u8
         const field = try r.byte();
         if (field == 0) break;
         const value = try r.string();
-
         switch (field) {
             'S' => severity = value,
             'C' => code = value,
@@ -1809,26 +1707,34 @@ fn parseErrorMessage(allocator: std.mem.Allocator, r: *buff.ReadBuf) ![]const u8
         }
     }
 
-    var result = std.array_list.Managed(u8).init(allocator);
-    defer result.deinit();
+    var result = ArrayList(u8).empty;
+    defer result.deinit(allocator);
 
     if (severity.len > 0) {
-        try result.writer().print("[{s}] ", .{severity});
+        const part = try std.fmt.allocPrint(allocator, "[{s}] ", .{severity});
+        defer allocator.free(part);
+        try result.appendSlice(allocator, part);
     }
     if (code.len > 0) {
-        try result.writer().print("({s}) ", .{code});
+        const part = try std.fmt.allocPrint(allocator, "({s}) ", .{code});
+        defer allocator.free(part);
+        try result.appendSlice(allocator, part);
     }
     if (message.len > 0) {
-        try result.writer().print("{s}", .{message});
+        try result.appendSlice(allocator, message);
     }
     if (detail.len > 0) {
-        try result.writer().print(" Detail: {s}", .{detail});
+        const part = try std.fmt.allocPrint(allocator, " Detail: {s}", .{detail});
+        defer allocator.free(part);
+        try result.appendSlice(allocator, part);
     }
     if (hint.len > 0) {
-        try result.writer().print(" Hint: {s}", .{hint});
+        const part = try std.fmt.allocPrint(allocator, " Hint: {s}", .{hint});
+        defer allocator.free(part);
+        try result.appendSlice(allocator, part);
     }
 
-    return try result.toOwnedSlice();
+    return try result.toOwnedSlice(allocator);
 }
 
 fn decideColumnFormats(allocator: std.mem.Allocator, colTyps: []FieldDesc, forceText: bool) ![]u8 {
@@ -1855,15 +1761,16 @@ fn decideColumnFormats(allocator: std.mem.Allocator, colTyps: []FieldDesc, force
     } else if (allText) {
         return allocator.dupe(u8, &[_]u8{ 0, 0 });
     } else {
-        var buf2 = std.array_list.Managed(u8).init(allocator);
-        try buf2.appendSlice(&[_]u8{ 0, @intCast(fmts.len) });
+        var buf2: ArrayList(u8) = .empty;
+        defer buf2.deinit(allocator);
+        try buf2.appendSlice(allocator, &[_]u8{ 0, @intCast(fmts.len) });
         for (fmts) |f| {
             const val: i16 = @intFromEnum(f);
             var bytes: [2]u8 = undefined;
             std.mem.writeInt(i16, &bytes, val, .big);
-            try buf2.appendSlice(&bytes);
+            try buf2.appendSlice(allocator, &bytes);
         }
-        return buf2.toOwnedSlice();
+        return buf2.toOwnedSlice(allocator);
     }
 }
 

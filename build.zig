@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .name = "pgzz",
         .root_module = pq_module,
     });
-    lib.linkLibC();
+    lib.root_module.link_libc = true;
 
     b.installArtifact(lib);
 }

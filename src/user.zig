@@ -11,9 +11,8 @@ pub const UserError = error{
 };
 
 /// Returns the current operating system user name.
-/// On Unix-like systems, it first attempts `std.os.getenv("USER")`.
-/// On Windows, it calls `GetUserNameExW` with `NameSamCompatible` and returns
-/// the base name (last component) of the result.
+/// On Unix-like systems, it uses `getpwuid(getuid())` to retrieve the username.
+/// On Windows, it calls `GetUserNameW` to get the current user.
 pub fn userCurrent(allocator: std.mem.Allocator) ![]const u8 {
     const is_windows = builtin.os.tag == .windows;
     if (is_windows) {
@@ -23,20 +22,19 @@ pub fn userCurrent(allocator: std.mem.Allocator) ![]const u8 {
     }
 }
 
-/// Unix-like implementation: get from environment variable USER.
+/// Unix-like implementation: get username from passwd database.
 fn userCurrentPosix(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.os.getenv("USER")) |user| {
-        return try allocator.dupe(u8, user);
-    }
-    return error.CouldNotDetectUsername;
+    const uid = std.posix.getuid();
+    const passwd = std.posix.getpwuid(uid) orelse {
+        return error.CouldNotDetectUsername;
+    };
+    // passwd.pw_name is a null-terminated C string
+    const name = std.mem.sliceTo(passwd.pw_name, 0);
+    return try allocator.dupe(u8, name);
 }
 
-/// Windows implementation: use GetUserNameExW.
+/// Windows implementation: use GetUserNameW.
 fn userCurrentWindows(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "USERNAME")) |username| {
-        return username;
-    } else |_| {}
-
     const GetUserNameW = struct {
         extern "advapi32" fn GetUserNameW(
             lpBuffer: [*]u16,

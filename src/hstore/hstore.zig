@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.ArrayList;
 
 /// Hstore represents a PostgreSQL hstore value, which is a key-value map stored as text.
 /// The value can be NULL (map == null) or a non-null map from string keys to optional string values.
@@ -74,10 +75,10 @@ pub const Hstore = struct {
         var saw_backslash = false;
 
         // Buffers for building key and value strings
-        var key_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer key_buf.deinit();
-        var val_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer val_buf.deinit();
+        var key_buf = ArrayList(u8).empty;
+        defer key_buf.deinit(self.allocator);
+        var val_buf = ArrayList(u8).empty;
+        defer val_buf.deinit(self.allocator);
 
         // Parse the hstore text representation
         while (i < bytes.len) : (i += 1) {
@@ -86,9 +87,9 @@ pub const Hstore = struct {
             // Handle escaped characters
             if (saw_backslash) {
                 if (parsing_key) {
-                    try key_buf.append(b);
+                    try key_buf.append(self.allocator, b);
                 } else {
-                    try val_buf.append(b);
+                    try val_buf.append(self.allocator, b);
                 }
                 saw_backslash = false;
                 continue;
@@ -118,8 +119,8 @@ pub const Hstore = struct {
                             },
                             ',' => {
                                 // End of current key-value pair
-                                const key = try key_buf.toOwnedSlice();
-                                const val_str = try val_buf.toOwnedSlice();
+                                const key = try key_buf.toOwnedSlice(self.allocator);
+                                const val_str = try val_buf.toOwnedSlice(self.allocator);
                                 const val = if (!value_was_quoted and std.ascii.eqlIgnoreCase(val_str, "null")) blk: {
                                     self.allocator.free(val_str);
                                     break :blk null;
@@ -137,9 +138,9 @@ pub const Hstore = struct {
                     }
                     // Add character to current key or value
                     if (parsing_key) {
-                        try key_buf.append(b);
+                        try key_buf.append(self.allocator, b);
                     } else {
-                        try val_buf.append(b);
+                        try val_buf.append(self.allocator, b);
                     }
                 },
             }
@@ -147,8 +148,8 @@ pub const Hstore = struct {
 
         // Handle the last pair (if any)
         if (key_buf.items.len > 0 or val_buf.items.len > 0) {
-            const key = try key_buf.toOwnedSlice();
-            const val_str = try val_buf.toOwnedSlice();
+            const key = try key_buf.toOwnedSlice(self.allocator);
+            const val_str = try val_buf.toOwnedSlice(self.allocator);
             const val = if (!value_was_quoted and std.ascii.eqlIgnoreCase(val_str, "null")) blk: {
                 self.allocator.free(val_str);
                 break :blk null;
@@ -169,32 +170,32 @@ pub const Hstore = struct {
             return @as(?[]const u8, s);
         }
 
-        var parts = std.array_list.Managed(u8).init(self.allocator);
-        defer parts.deinit();
+        var parts = ArrayList(u8).empty;
+        defer parts.deinit(self.allocator);
 
         var it = m.iterator();
         var first = true;
         while (it.next()) |entry| {
             if (!first) {
-                try parts.appendSlice(",");
+                try parts.appendSlice(self.allocator, ",");
             }
             first = false;
 
             // Quote and escape the key
             const quoted_key = try quote(self.allocator, entry.key_ptr.*);
             defer self.allocator.free(quoted_key);
-            try parts.appendSlice(quoted_key);
+            try parts.appendSlice(self.allocator, quoted_key);
 
             // Add separator
-            try parts.appendSlice("=>");
+            try parts.appendSlice(self.allocator, "=>");
 
             // Quote and escape the value (or use "NULL" for null)
             const quoted_val = try quoteOptional(self.allocator, entry.value_ptr.*);
             defer self.allocator.free(quoted_val);
-            try parts.appendSlice(quoted_val);
+            try parts.appendSlice(self.allocator, quoted_val);
         }
 
-        const result = try parts.toOwnedSlice();
+        const result = try parts.toOwnedSlice(self.allocator);
         return @as(?[]const u8, result);
     }
 
@@ -220,18 +221,18 @@ pub const Hstore = struct {
 /// Strings with special characters (", \) are escaped.
 /// Returns an allocated slice that must be freed by the caller.
 fn quote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-    try buf.append('"');
+    var buf = ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '"');
     for (s) |c| {
         switch (c) {
-            '\\' => try buf.appendSlice("\\\\"),
-            '"' => try buf.appendSlice("\\\""),
-            else => try buf.append(c),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            else => try buf.append(allocator, c),
         }
     }
-    try buf.append('"');
-    return buf.toOwnedSlice();
+    try buf.append(allocator, '"');
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Quotes an optional string for hstore output.

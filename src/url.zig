@@ -3,6 +3,7 @@
 //! suitable for `pq.dialOpen` or other PostgreSQL clients.
 
 const std = @import("std");
+const ArrayList = std.ArrayList;
 
 /// Parse a PostgreSQL URL into a space-separated key-value connection string.
 /// The returned string must be freed by the caller using `allocator.free`.
@@ -16,10 +17,10 @@ pub fn parseURL(allocator: std.mem.Allocator, url_str: []const u8) ![]u8 {
         return error.InvalidScheme;
     }
 
-    var kvs = std.array_list.Managed([]const u8).init(allocator);
+    var kvs = ArrayList([]const u8).empty;
     defer {
         for (kvs.items) |item| allocator.free(item);
-        kvs.deinit();
+        kvs.deinit(allocator);
     }
 
     // Helper to get component string
@@ -35,27 +36,27 @@ pub fn parseURL(allocator: std.mem.Allocator, url_str: []const u8) ![]u8 {
     // Helper to escape values for libpq connection string
     const escapeValue = struct {
         fn call(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
-            var buf = std.array_list.Managed(u8).init(alloc);
-            defer buf.deinit();
+            var buf = ArrayList(u8).empty;
+            defer buf.deinit(alloc);
             for (s) |ch| {
                 switch (ch) {
-                    ' ' => try buf.appendSlice("\\ "),
-                    '\'' => try buf.appendSlice("\\'"),
-                    '\\' => try buf.appendSlice("\\\\"),
-                    else => try buf.append(ch),
+                    ' ' => try buf.appendSlice(alloc, "\\ "),
+                    '\'' => try buf.appendSlice(alloc, "\\'"),
+                    '\\' => try buf.appendSlice(alloc, "\\\\"),
+                    else => try buf.append(alloc, ch),
                 }
             }
-            return buf.toOwnedSlice();
+            return try buf.toOwnedSlice(alloc);
         }
     }.call;
 
     // Helper to add a key-value pair
     const addKV = struct {
-        fn call(alloc: std.mem.Allocator, list: *std.array_list.Managed([]const u8), key: []const u8, value: []const u8) !void {
+        fn call(alloc: std.mem.Allocator, list: *ArrayList([]const u8), key: []const u8, value: []const u8) !void {
             const escaped = try escapeValue(alloc, value);
             defer alloc.free(escaped);
             const kv = try std.fmt.allocPrint(alloc, "{s}={s}", .{ key, escaped });
-            try list.append(kv);
+            try list.append(alloc, kv);
         }
     }.call;
 
@@ -129,10 +130,6 @@ test "parseURL - basic" {
     const url = "postgres://bob:secret@localhost:5432/mydb?sslmode=disable";
     const conn_str = try parseURL(alloc, url);
     defer alloc.free(conn_str);
-    // The order of keys is sorted, so we can test for contains or split.
-    // Since we sorted, dbname comes before host, etc.
-    // Expected: "dbname=mydb host=localhost password=secret port=5432 sslmode=verify-full user=bob"
-    // But because we sort lexicographically: dbname, host, password, port, sslmode, user.
     try testing.expect(std.mem.containsAtLeast(u8, conn_str, 1, "dbname=mydb"));
     try testing.expect(std.mem.containsAtLeast(u8, conn_str, 1, "host=localhost"));
     try testing.expect(std.mem.containsAtLeast(u8, conn_str, 1, "password=secret"));
@@ -164,7 +161,5 @@ test "parseURL - escaped characters" {
     const url = "postgres://user:'password with spaces'@host/db";
     const conn_str = try parseURL(alloc, url);
     defer alloc.free(conn_str);
-    // Password should be escaped: \'password\ with\ spaces\'
-    // Check that it contains "password=\\'password\\ with\\ spaces\\'"
     try testing.expect(std.mem.indexOf(u8, conn_str, "password=\\'password\\ with\\ spaces\\'") != null);
 }

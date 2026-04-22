@@ -3,14 +3,9 @@ const pgzz = @import("pgzz");
 const Connection = pgzz.conn;
 
 pub fn main() !void {
-    // Initialize General Purpose Allocator with enhanced debugging features
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .stack_trace_frames = 10, // Enable stack traces
-        .enable_memory_limit = true,
-        .never_unmap = true,
-        .retain_metadata = true,
-        .safety = true,
-    }){};
+    // const allocator = std.heap.c_allocator;
+    const DebugAllocator = std.heap.DebugAllocator(.{});
+    var gpa = DebugAllocator{};
     defer {
         const check = gpa.deinit();
         if (check != .ok) @panic("memory leak detected");
