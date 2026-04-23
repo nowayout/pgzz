@@ -21,7 +21,8 @@ pub const ReadBuf = struct {
     /// Returns error.InsufficientData if not enough bytes remain
     pub fn int32(self: *ReadBuf) !i32 {
         if (self.data.len < 4) return error.InsufficientData;
-        const n = std.mem.readInt(i32, self.data[0..4], .big);
+        const bytes = self.data[0..4];
+        const n = std.mem.readInt(i32, &[_]u8{ bytes[0], bytes[1], bytes[2], bytes[3] }, .big);
         self.data = self.data[4..];
         return n;
     }
@@ -30,7 +31,8 @@ pub const ReadBuf = struct {
     /// Returns error.InsufficientData if not enough bytes remain
     pub fn oid(self: *ReadBuf) !Oid {
         if (self.data.len < 4) return error.InsufficientData;
-        const n = std.mem.readInt(u32, self.data[0..4], .big);
+        const bytes = self.data[0..4];
+        const n = std.mem.readInt(u32, &[_]u8{ bytes[0], bytes[1], bytes[2], bytes[3] }, .big);
         self.data = self.data[4..];
         return n;
     }
@@ -39,7 +41,8 @@ pub const ReadBuf = struct {
     /// Returns error.InsufficientData if not enough bytes remain
     pub fn int16(self: *ReadBuf) !i16 {
         if (self.data.len < 2) return error.InsufficientData;
-        const n = std.mem.readInt(i16, self.data[0..2], .big);
+        const bytes = self.data[0..2];
+        const n = std.mem.readInt(i16, &[_]u8{ bytes[0], bytes[1] }, .big);
         self.data = self.data[2..];
         return n;
     }
@@ -188,7 +191,7 @@ test "WriteBuf: single message" {
 
     // Verify message structure
     try testing.expectEqual(@as(u8, 'Q'), full[0]);
-    const msg_len = std.mem.readInt(u32, full[1..5], .big);
+    const msg_len = std.mem.readInt(u32, &[_]u8{ full[1], full[2], full[3], full[4] }, .big);
     try testing.expectEqual(@as(u32, 13), msg_len); // 8 chars + null + 4 bytes for len
 
     const expected = "SELECT 1" ++ "\x00";
@@ -209,7 +212,7 @@ test "WriteBuf: multiple messages" {
 
     // Verify first message
     try testing.expectEqual(@as(u8, 'P'), msg1[0]);
-    const len1 = std.mem.readInt(u32, msg1[1..5], .big);
+    const len1 = std.mem.readInt(u32, &[_]u8{ msg1[1], msg1[2], msg1[3], msg1[4] }, .big);
     try testing.expectEqual(@as(u32, 22), len1);
 
     // Second message: Bind

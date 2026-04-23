@@ -1,6 +1,70 @@
 const std = @import("std");
 const pgzz = @import("pgzz");
-const Connection = pgzz.conn;
+const Conn = pgzz.conn.Conn;
+
+const ConnectionPool = struct {
+    allocator: std.mem.Allocator,
+    conn_string: []const u8,
+    max_conn: usize,
+    available: std.ArrayList(*Conn),
+    in_use: std.ArrayList(*Conn),
+    total_created: usize,
+
+    pub fn init(allocator: std.mem.Allocator, conn_string: []const u8, max_conn: usize) !ConnectionPool {
+        return ConnectionPool{
+            .allocator = allocator,
+            .conn_string = try allocator.dupe(u8, conn_string),
+            .max_conn = max_conn,
+            .available = std.ArrayList(*Conn).empty,
+            .in_use = std.ArrayList(*Conn).empty,
+            .total_created = 0,
+        };
+    }
+
+    pub fn deinit(self: *ConnectionPool) void {
+        for (self.available.items) |conn| {
+            conn.close();
+            conn.deinit();
+        }
+        self.available.deinit(self.allocator);
+        for (self.in_use.items) |conn| {
+            conn.close();
+            conn.deinit();
+        }
+        self.in_use.deinit(self.allocator);
+        self.allocator.free(self.conn_string);
+    }
+
+    pub fn get(self: *ConnectionPool) !*Conn {
+        if (self.available.items.len > 0) {
+            const conn = self.available.pop().?;
+            try self.in_use.append(self.allocator, conn);
+            return conn;
+        }
+        if (self.total_created < self.max_conn) {
+            const conn = try pgzz.conn.open(self.allocator, self.conn_string);
+            self.total_created += 1;
+            try self.in_use.append(self.allocator, conn);
+            return conn;
+        }
+        return error.NoAvailableConnection;
+    }
+
+    pub fn put(self: *ConnectionPool, conn: *Conn) void {
+        for (self.in_use.items, 0..) |c, i| {
+            if (c == conn) {
+                _ = self.in_use.swapRemove(i);
+                self.available.append(self.allocator, conn) catch {
+                    conn.close();
+                    conn.deinit();
+                };
+                return;
+            }
+        }
+        conn.close();
+        conn.deinit();
+    }
+};
 
 pub fn main() !void {
     // const allocator = std.heap.c_allocator;
@@ -13,19 +77,22 @@ pub fn main() !void {
 
     const allocator = gpa.allocator();
 
-    // 1. Connect to PostgreSQL database
-    var _conn = try Connection.open(allocator, "host=127.0.0.1 port=5432 user=postgres dbname=postgres password=secret sslmode=disable");
-    // var _conn = try Connection.open(allocator, "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable");
-    defer {
-        _conn.close();
-        _conn.deinit();
-    }
+    const conn_string = "host=127.0.0.1 port=5432 user=postgres dbname=postgres password=secret sslmode=disable";
+    //const conn_string = "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable";
 
-    // 2. Drop existing table (if any)
+    // 1. Initial connection pool
+    var pool = try ConnectionPool.init(allocator, conn_string, 10);
+    defer pool.deinit();
+
+    // 2. get a connection from pool
+    var _conn = try pool.get();
+    defer pool.put(_conn);
+
+    // 3. Drop existing table (if any)
     const drop_res = try _conn.exec("DROP TABLE IF EXISTS subhana_allah_t");
     defer _conn.allocator.free(drop_res.tag);
 
-    // 3. Create new table
+    // 4. Create new table
     const create_res = try _conn.exec(
         \\CREATE TABLE IF NOT EXISTS subhana_allah_t (
         \\    id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
@@ -37,7 +104,7 @@ pub fn main() !void {
     );
     defer _conn.allocator.free(create_res.tag);
 
-    // 4. Prepare INSERT statement with parameters
+    // 5. Prepare INSERT statement with parameters
     var stmt = try _conn.prepare(
         \\INSERT INTO subhana_allah_t(v_str, v_varchar, v_bool, ts)
         \\VALUES ($1, $2, $3, $4)
@@ -47,7 +114,7 @@ pub fn main() !void {
         stmt.deinit(); // Free client-side memory
     }
 
-    // 5. Insert 20 rows with different values
+    // 6. Insert 20 rows with different values
     for (0..20) |i| {
         const bool_val = (i % 4 == 0);
         const hour = i % 24;
@@ -64,7 +131,7 @@ pub fn main() !void {
         defer _conn.allocator.free(insert_res.tag);
     }
 
-    // 6. Query all rows using manual field extraction
+    // 7. Query all rows using manual field extraction
     var rows = try _conn.query("SELECT id, v_str, v_varchar, v_bool, ts FROM subhana_allah_t");
     errdefer rows.deinit();
     defer rows.deinit();
@@ -87,7 +154,7 @@ pub fn main() !void {
         std.debug.print("   {d}\t| '{s}' | '{s}' | {any} | ts={s} (parsed={s})\n", .{ id, v_str, v_varchar, b, ts_str, formatted });
     }
 
-    // Structure representing a database row
+    // 8. Structure representing a database row
     const MyRow = struct {
         id: i32,
         v_str: []const u8, // TEXT field
@@ -96,7 +163,7 @@ pub fn main() !void {
         ts_ns: i128,
     };
 
-    // 7. Query all rows using automatic scanning into struct
+    // 9. Query all rows using automatic scanning into struct
     var rows2 = try _conn.query("SELECT id, v_str, v_varchar, v_bool, ts FROM subhana_allah_t");
     errdefer rows2.deinit();
     defer rows2.deinit();

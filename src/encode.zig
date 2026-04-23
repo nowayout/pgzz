@@ -129,15 +129,24 @@ fn binaryDecode(allocator: std.mem.Allocator, ps: *const ParameterStatus, data: 
         oid.T_bytea => return .{ .bytes = try allocator.dupe(u8, data) },
         oid.T_int8 => {
             if (data.len != 8) return error.InvalidBinaryLength;
-            return .{ .int = @as(i64, @bitCast(std.mem.readInt(u64, data[0..8], .big))) };
+            const bytes = data[0..8];
+            const n = std.mem.readInt(i64, &[_]u8{
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            }, .big);
+            return .{ .int = n };
         },
         oid.T_int4 => {
             if (data.len != 4) return error.InvalidBinaryLength;
-            return .{ .int = @as(i32, @bitCast(std.mem.readInt(u32, data[0..4], .big))) };
+            const bytes = data[0..4];
+            const n = std.mem.readInt(i32, &[_]u8{ bytes[0], bytes[1], bytes[2], bytes[3] }, .big);
+            return .{ .int = n };
         },
         oid.T_int2 => {
             if (data.len != 2) return error.InvalidBinaryLength;
-            return .{ .int = @as(i16, @bitCast(std.mem.readInt(u16, data[0..2], .big))) };
+            const bytes = data[0..2];
+            const n = std.mem.readInt(i16, &[_]u8{ bytes[0], bytes[1] }, .big);
+            return .{ .int = n };
         },
         oid.T_uuid => {
             const uuid_str = try decodeUUIDBinary(allocator, data);

@@ -117,7 +117,7 @@ pub const Dialer = struct {
 
 pub const Conn = struct {
     allocator: std.mem.Allocator,
-    arena: *std.heap.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
     socket: std.Io.net.Stream,
     read_buffer: []u8,
     write_buffer: []u8,
@@ -139,33 +139,6 @@ pub const Conn = struct {
     socket_open: bool = false,
     notice_handler: ?*const fn (*Conn, []const u8) void = null,
     notification_handler: ?*const fn (*Conn, []const u8, i32, []const u8) void = null,
-
-    /// Initializes a new connection structure without establishing network connection.
-    pub fn init(allocator: std.mem.Allocator, opts: Options) !*Conn {
-        return Conn{
-            .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .socket = undefined,
-            .read_buffer = &[_]u8{},
-            .write_buffer = &[_]u8{},
-            .opts = opts,
-            .dialer = Dialer.default,
-            .processID = 0,
-            .secretKey = 0,
-            .txnStatus = .Idle,
-            .parameterStatus = .{},
-            .disablePreparedBinaryResult = false,
-            .binaryParameters = false,
-            .bad = false,
-            .inCopy = false,
-            .savedMsgType = 0,
-            .savedMsgBuf = null,
-            .nameCounter = 0,
-            .socket_open = false,
-            .notice_handler = null,
-            .notification_handler = null,
-        };
-    }
 
     /// Releases all resources associated with the connection.
     pub fn deinit(self: *Conn) void {
@@ -189,7 +162,6 @@ pub const Conn = struct {
         }
 
         self.arena.deinit();
-        self.allocator.destroy(self.arena);
         self.arena = undefined;
         self.allocator.destroy(self);
     }
@@ -205,48 +177,22 @@ pub const Conn = struct {
 
     /// Opens a connection with a custom dialer.
     pub fn dialOpen(allocator: std.mem.Allocator, dialer: Dialer, name: []const u8) !*Conn {
-        const arena_ptr = try allocator.create(std.heap.ArenaAllocator);
-        arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer {
-            arena_ptr.deinit();
-            allocator.destroy(arena_ptr);
-        }
-
-        var opts = Options.init(allocator);
-        var opts_initialized = false;
-        defer if (!opts_initialized) {
-            var it = opts.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                allocator.free(entry.value_ptr.*);
-            }
-            opts.deinit();
-        };
-
-        const arena_allocator = arena_ptr.allocator();
-
-        // Parse URL or connection string
-        var conn_str = name;
-        if (std.mem.startsWith(u8, name, "postgres://") or std.mem.startsWith(u8, name, "postgresql://")) {
-            const converted = try url.parseURL(arena_allocator, name);
-            conn_str = converted;
-        }
-        try parseOptsWithDefaults(allocator, conn_str, &opts);
-
-        opts_initialized = true;
-
         var threaded: Io.Threaded = .init_single_threaded;
         const io = threaded.io();
 
         // Allocate connection struct
         const cn = try allocator.create(Conn);
+        errdefer {
+            cn.deinit();
+            allocator.destroy(cn);
+        }
         cn.* = .{
             .allocator = allocator,
-            .arena = arena_ptr,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .socket = undefined,
             .read_buffer = &[_]u8{},
             .write_buffer = &[_]u8{},
-            .opts = opts,
+            .opts = Options.init(allocator),
             .io = io,
             .dialer = dialer,
             .processID = 0,
@@ -265,13 +211,13 @@ pub const Conn = struct {
             .notification_handler = null,
         };
 
-        var success = false;
-        defer if (!success) {
-            if (cn.read_buffer.len > 0) allocator.free(cn.read_buffer);
-            if (cn.write_buffer.len > 0) allocator.free(cn.write_buffer);
-            if (cn.socket_open) cn.socket.close(cn.io);
-            allocator.destroy(cn);
-        };
+        // Parse URL or connection string
+        var conn_str = name;
+        if (std.mem.startsWith(u8, name, "postgres://") or std.mem.startsWith(u8, name, "postgresql://")) {
+            const converted = try url.parseURL(cn.arena.allocator(), name);
+            conn_str = converted;
+        }
+        try parseOptsWithDefaults(allocator, conn_str, &cn.opts);
 
         const host = cn.opts.get("host").?;
         const port_str = cn.opts.get("port").?;
@@ -284,7 +230,6 @@ pub const Conn = struct {
         try cn.ssl();
         try cn.startup();
 
-        success = true;
         return cn;
     }
 
@@ -1036,18 +981,16 @@ pub const Conn = struct {
 
     /// Closes the connection gracefully.
     pub fn close(self: *Conn) void {
-        if (self.bad) {
-            return;
-        }
-
+        if (self.bad) return;
         self.bad = true;
-
-        var msg_buf: [5]u8 = undefined;
-        msg_buf[0] = 'X';
-        std.mem.writeInt(i32, msg_buf[1..5], 4, .big);
-        var writer = self.socket.writer(self.io, &[_]u8{});
-        _ = writer.interface.writeAll(&msg_buf) catch {};
-        self.socket.close(self.io);
+        if (self.socket_open) {
+            var msg_buf: [5]u8 = undefined;
+            msg_buf[0] = 'X';
+            std.mem.writeInt(i32, msg_buf[1..5], 4, .big);
+            var writer = self.socket.writer(self.io, &[_]u8{});
+            _ = writer.interface.writeAll(&msg_buf) catch {};
+            self.socket.close(self.io);
+        }
     }
 };
 
@@ -1660,23 +1603,6 @@ fn parseOptsWithDefaults(allocator: std.mem.Allocator, name: []const u8, opts: *
         const user = try userCurrent(allocator);
         try opts.put(try allocator.dupe(u8, "user"), user);
     }
-}
-
-fn unquoteValue(quoted: []const u8) []const u8 {
-    if (quoted.len < 2 or quoted[0] != '\'' or quoted[quoted.len - 1] != '\'') return quoted;
-    var result = std.ArrayList(u8).empty;
-    defer result.deinit(std.heap.page_allocator);
-    var i: usize = 1;
-    while (i < quoted.len - 1) {
-        if (quoted[i] == '\\' and i + 1 < quoted.len - 1) {
-            result.append(quoted[i + 1]) catch break;
-            i += 2;
-        } else {
-            result.append(quoted[i]) catch break;
-            i += 1;
-        }
-    }
-    return result.items;
 }
 
 fn md5s(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {

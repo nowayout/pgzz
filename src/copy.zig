@@ -208,7 +208,9 @@ pub const CopyIn = struct {
 
         // Update message length (excluding the 'd' identifier)
         const len = items.len - 1; // Length of payload
-        std.mem.writeInt(u32, @constCast(items[1..5]), @intCast(len), .big);
+        var len_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, @intCast(len), .big);
+        @memcpy(items[1..5], &len_bytes);
 
         // Write to connection
         var writer = self.cn.socket.writer(self.cn.io, &[_]u8{});
