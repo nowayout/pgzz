@@ -2,10 +2,6 @@
 
     pgzz​ is a lightweight, asynchronous PostgreSQL driver written in pure Zig. It speaks the PostgreSQL wire protocol (v3) directly, without depending on libpqor any C libraries. Built for simplicity, performance, and safety.
 
-## Status
-
-    ⚠️ **Alpha**​ – Core query and connection logic works, but the API may change. Production use not yet recommended. Contributions and testing feedback are welcome!
-
 * Features
     * Pure Zig, no external dependencies
     * Asynchronous I/O (uses std.netand std.posix.poll)
